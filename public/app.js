@@ -4,7 +4,7 @@ import {
 } from '/shared/rules.js';
 import { icon, withIcon } from '/icons.js';
 import { openGenerator } from '/generator.js';
-import { $, esc, api, getJson, toast, setupMockLogin, dayLabel, fmtTs, fmtDT, TF_ACTIVE, TF_LABEL, decideTimeoff, renderNav, rememberView, fmtHM } from '/common.js';
+import { $, esc, api, getJson, toast, setupMockLogin, dayLabel, fmtTs, fmtDT, TF_ACTIVE, TF_LABEL, decideTimeoff, renderNav, rememberView, fmtHM, startPresence, renderPresence } from '/common.js';
 
 const WD = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
 const COL_W = 64;
@@ -29,6 +29,7 @@ async function init() {
   S.month = parseRoute().month ?? S.meta.defaultMonth; $('#monthInput').value = S.month;
   await setupMockLogin($('#mockUser'), () => { closePanelForce(); start(false); });
   await start(true);
+  presence = startPresence({ page: 'escalas', getCtx: () => ({ team: S.team, month: S.month }), onUpdate: (l) => renderPresence(l, { chipsEl: $('#presence'), noteEl: $('#presenceNote') }) });
   setInterval(softRefresh, 15000);
   window.addEventListener('popstate', onPopState);
 }
@@ -65,7 +66,9 @@ async function start(useRoute) {
   $('#teamSelect').innerHTML = S.me.teams.map((t) => `<option value="${esc(t.name)}" ${t.name === S.team ? 'selected' : ''}>${esc(t.name)} · ${t.role === 'editor' ? 'edição' : 'leitura'} (${t.agentCount})</option>`).join('');
   await load();
 }
+let presence = null; // presença: avisa na hora quando troca de time ou mês
 async function load() {
+  presence?.touch();
   const q = `month=${S.month}&team=${encodeURIComponent(S.team)}`;
   [S.data, S.timeoffs] = await Promise.all([getJson(`/api/schedule?${q}`), getJson(`/api/timeoffs?${q}`)]);
   renderAll();

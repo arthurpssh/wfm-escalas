@@ -1,5 +1,5 @@
 import { withIcon } from '/icons.js';
-import { $, esc, api, getJson, toast, setupMockLogin, fmtTs, renderNav, rememberView, recallView } from '/common.js';
+import { $, esc, api, getJson, toast, setupMockLogin, fmtTs, renderNav, rememberView, recallView, startPresence, renderPresence } from '/common.js';
 
 const ST = {
   aguardando_verificacao: 'aguardando publicação', nao_publicada: 'importada, não publicada', divergente: 'divergente',
@@ -27,7 +27,9 @@ async function start(useRoute) {
   await load();
 }
 
+let presence = null;
 async function load() {
+  presence?.touch();
   S.items = await getJson(`/api/exports?team=${encodeURIComponent(S.team)}`);
   S.role = S.me.teams.find((t) => t.name === S.team)?.role ?? 'viewer';
   $('#roleBanner').classList.toggle('hidden', S.role === 'editor');
@@ -122,6 +124,7 @@ window.addEventListener('popstate', async () => { const t = parseRoute(); if (t)
     S.meta = await getJson('/api/meta');
     await setupMockLogin($('#mockUser'), () => start(false));
     await start(true);
+    presence = startPresence({ page: 'exportacoes', getCtx: () => ({ team: S.team, month: '' }), onUpdate: (l) => renderPresence(l, { chipsEl: $('#presence') }) });
     setInterval(() => load().catch(() => {}), 20000);
   } catch (e) { toast(e.message, true); }
 })();

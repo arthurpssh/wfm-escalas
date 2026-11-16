@@ -1,5 +1,5 @@
 import { icon, withIcon } from '/icons.js';
-import { $, esc, api, getJson, toast, setupMockLogin, fmtTs, fmtDT, TF_LABEL, decideTimeoff, renderNav, rememberView, recallView, fmtHM } from '/common.js';
+import { $, esc, api, getJson, toast, setupMockLogin, fmtTs, fmtDT, TF_LABEL, decideTimeoff, renderNav, rememberView, recallView, fmtHM, startPresence, renderPresence } from '/common.js';
 import { localMonth } from '/shared/rules.js';
 
 const ORIGIN = { app: 'app', agent: 'agente', wfm: 'WFM' };
@@ -32,7 +32,9 @@ async function start(useRoute) {
   await load();
 }
 
+let presence = null;
 async function load() {
+  presence?.touch();
   const q = `team=${encodeURIComponent(S.team)}&month=${S.month}`;
   const [sch, tos] = await Promise.all([getJson(`/api/schedule?${q}`), getJson(`/api/timeoffs?${q}`)]);
   S.agents = sch.agents; S.role = sch.role; S.timeoffs = tos;
@@ -84,6 +86,6 @@ $('#nextMonth').onclick = () => setMonth(shift(1));
 window.addEventListener('popstate', async () => { const r = parseRoute(); if (r.team) S.team = r.team; if (r.month) S.month = r.month; $('#teamSelect').value = S.team; $('#monthInput').value = S.month; await load(); });
 
 (async () => {
-  try { await setupMockLogin($('#mockUser'), () => start(false)); await start(true); setInterval(() => load().catch(() => {}), 20000); }
+  try { await setupMockLogin($('#mockUser'), () => start(false)); await start(true); presence = startPresence({ page: 'folgas', getCtx: () => ({ team: S.team, month: S.month }), onUpdate: (l) => renderPresence(l, { chipsEl: $('#presence') }) }); setInterval(() => load().catch(() => {}), 20000); }
   catch (e) { toast(e.message, true); }
 })();

@@ -1,4 +1,4 @@
-import { $, esc, api, getJson, toast, setupMockLogin, fmtTs, renderNav } from '/common.js';
+import { $, esc, api, getJson, toast, setupMockLogin, fmtTs, renderNav, startPresence } from '/common.js';
 
 let meta, me, teams = [];
 
@@ -6,6 +6,8 @@ async function init() {
   meta = await getJson('/api/meta');
   await setupMockLogin($('#mockUser'), start);
   await start();
+  startPresence({ page: 'admin', getCtx: () => ({}), onUpdate: () => {} });
+  setInterval(() => { if (me?.isAdmin) refreshPresence().catch(() => {}); }, 20000);
 }
 async function start() {
   try { me = await getJson('/api/me'); } catch (e) { return toast(e.message, true); }
@@ -13,7 +15,7 @@ async function start() {
   renderNav('admin', me);
   $('#denied').classList.toggle('hidden', me.isAdmin);
   $('#content').classList.toggle('hidden', !me.isAdmin);
-  if (me.isAdmin) { await Promise.all([renderStats(), renderHistory(), renderAccess()]); }
+  if (me.isAdmin) { await Promise.all([renderStats(), renderHistory(), renderAccess()]); await refreshPresence(); }
 }
 
 // Abas = rotas: /admin/estatisticas | /admin/historico | /admin/acessos
@@ -31,11 +33,21 @@ showTab(location.pathname.split('/')[2]);
 
 // ---------- estatísticas ----------
 const bars = (rows) => { const max = Math.max(1, ...rows.map((r) => r.n)); return `<div class="bars">${rows.map((r) => `<div><span style="width:200px;overflow:hidden;text-overflow:ellipsis">${esc(r.key)}</span><i style="width:${(r.n / max) * 240}px"></i>${r.n}</div>`).join('') || '<small>sem dados</small>'}</div>`; };
+const PAGE = { escalas: 'Escala', folgas: 'Folgas', exportacoes: 'Exportações', admin: 'Admin' };
+const since = (iso) => { const m = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60000)); return m < 1 ? 'agora' : `há ${m} min`; };
+/** Quem está online agora (todas as páginas e times), atualizado a cada 20 s. */
+async function refreshPresence() {
+  const el = document.getElementById('presCard'); if (!el) return;
+  const { sessions } = await getJson('/api/admin/presence');
+  el.innerHTML = `<h3>Online agora (${sessions.length})</h3>${sessions.length ? `<table class="plain"><tr><th>Pessoa</th><th>Página</th><th>Time | mês</th><th>Online</th><th>Situação</th></tr>${sessions.map((u) => `<tr><td><b>${esc(u.name)}</b><br><small>${esc(u.email)}</small></td><td>${PAGE[u.page] ?? esc(u.page)}</td><td>${u.team ? esc(u.team) + (u.month ? ' | ' + u.month : '') : '—'}</td><td>${since(u.since)}${u.tabs > 1 ? ` <small>(${u.tabs} abas)</small>` : ''}</td><td>${u.editing.length ? `✎ editou ${u.editing.map((e) => 'há ' + Math.max(1, Math.round(e.agoSec / 60)) + ' min').join(', ')}` : u.active ? 'ativo' : 'aba em segundo plano'}</td></tr>`).join('')}</table>` : '<small>Ninguém online.</small>'}`;
+}
+
 async function renderStats() {
   const s = await getJson('/api/admin/stats');
   const t = s.totals;
   const card = (n, l) => `<div class="card"><b>${n}</b><span>${l}</span></div>`;
   $('#tab-estatisticas').innerHTML = `<div class="cards">${card(t.actions, 'ações registradas')}${card(t.activeUsers, 'usuários ativos')}${card(t.checkouts, 'checkouts (lotes)')}${card(t.jiraCards, 'cards de remoção')}${card(t.openDrafts, 'rascunhos abertos')}${card(t.staleDrafts, 'rascunhos parados (>24h)')}</div>
+    <div class="panel-card" id="presCard"><h3>Online agora</h3><small>carregando…</small></div>
     <div class="panel-card"><h3>Ações por tipo</h3>${bars(s.byAction)}</div>
     <div class="panel-card"><h3>Por usuário</h3>${bars(s.byActor)}</div>
     <div class="panel-card"><h3>Por time</h3>${bars(s.byTeam)}</div>

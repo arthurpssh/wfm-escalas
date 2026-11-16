@@ -136,3 +136,50 @@ test('trava: "acabou de ser confirmado por X" só vale por alguns minutos', () =
   t = 5 * 60_000 + 1;
   assert.equal(locks.recent('k'), null);
 });
+
+import { createPresence, displayName } from '../server/core/presence.js';
+test('presença: online por 60 s, várias abas = uma pessoa, sair, mesmo time/mês, e o "editando"', () => {
+  let t = 1_000_000;
+  const p = createPresence({ now: () => t });
+  p.ping({ sid: 'a1', email: 'arthur.santos@x.com', page: 'escalas', team: 'sup@x.com', month: '2026-11' });
+  p.ping({ sid: 'r1', email: 'ramon.soares@x.com', page: 'escalas', team: 'sup@x.com', month: '2026-11' });
+  p.ping({ sid: 'r2', email: 'ramon.soares@x.com', page: 'folgas', team: 'sup@x.com', month: '2026-11', visible: false }); // 2ª aba, oculta
+  p.ping({ sid: 'o1', email: 'outra@x.com', page: 'escalas', team: 'outro@x.com', month: '2026-11' }); // outro time
+  p.ping({ sid: 'm1', email: 'mes@x.com', page: 'escalas', team: 'sup@x.com', month: '2026-12' }); // outro mês
+
+  const vistoPeloArthur = p.users({ team: 'sup@x.com', month: '2026-11', excludeEmail: 'arthur.santos@x.com' });
+  assert.deepEqual(vistoPeloArthur.map((u) => u.email), ['ramon.soares@x.com']); // só o mesmo time e mês; ele mesmo não aparece
+  assert.deepEqual([vistoPeloArthur[0].name, vistoPeloArthur[0].tabs, vistoPeloArthur[0].active], ['Ramon Soares', 2, true]); // 2 abas = 1 pessoa; uma visível = ativo
+  assert.equal(vistoPeloArthur[0].editing, false);
+
+  p.markEdit('ramon.soares@x.com', 'sup@x.com', '2026-11'); // ramon salvou um dia
+  assert.equal(p.users({ team: 'sup@x.com', month: '2026-11', excludeEmail: 'arthur.santos@x.com' })[0].editing, true);
+  assert.equal(p.users({ team: 'sup@x.com', month: '2026-12', excludeEmail: 'x' }).find((u) => u.email === 'ramon.soares@x.com'), undefined); // no outro mês ele não está
+
+  t += 61_000; assert.equal(p.users({ all: true }).filter((u) => u.email.startsWith('ramon')).length, 1, 'aba oculta ainda vale (ttl x3)'); t += 120_000; // ninguém pingou há mais de 3 min
+  assert.deepEqual(p.users({ all: true }), []);
+  p.ping({ sid: 'a1', email: 'arthur.santos@x.com', page: 'admin' });
+  assert.equal(p.users({ all: true }).length, 1);
+  p.leave('a1', 'outro@x.com'); // não pode tirar a sessão de outra pessoa
+  assert.equal(p.users({ all: true }).length, 1);
+  p.leave('a1', 'arthur.santos@x.com');
+  assert.equal(p.users({ all: true }).length, 0);
+});
+
+test('presença: o "editando" expira em 3 min; lista global traz onde editou; sid reaproveitado por outro e-mail recomeça', () => {
+  let t = 0;
+  const p = createPresence({ now: () => t, ttlMs: 10 * 60_000 });
+  p.ping({ sid: 's1', email: 'a@x.com', page: 'escalas', team: 'sup@x.com', month: '2026-11' });
+  p.markEdit('a@x.com', 'sup@x.com', '2026-11');
+  const g = p.users({ all: true })[0];
+  assert.deepEqual([g.editing[0].team, g.editing[0].month], ['sup@x.com', '2026-11']);
+  t = 181_000;
+  assert.deepEqual(p.users({ all: true })[0].editing, []);
+  assert.equal(p.users({ team: 'sup@x.com', month: '2026-11', excludeEmail: 'x' })[0].editing, false);
+  t = 200_000;
+  p.ping({ sid: 's1', email: 'b@x.com', page: 'escalas', team: 'sup@x.com', month: '2026-11' }); // mesmo sid, outra pessoa
+  const u = p.users({ all: true }).map((x) => [x.email, x.since]);
+  assert.deepEqual(u, [['b@x.com', new Date(200_000).toISOString()]]); // não herdou a sessão da outra pessoa
+  assert.equal(displayName('ramon.soares@hotmart.com'), 'Ramon Soares');
+  assert.equal(displayName('sup_alfa-1@x.com'), 'Sup Alfa 1');
+});

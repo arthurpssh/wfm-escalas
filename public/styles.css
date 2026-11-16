@@ -179,6 +179,14 @@ details.gen-out small { color: var(--muted-fg); margin-left: 8px; }
 .df-list b { font-weight: 700; }
 .df-empty { color: var(--neg-fg); font-weight: 700; font-size: 14px; padding: 2px 0; }
 @media (max-width: 700px) { .df-row { grid-template-columns: 1fr; gap: 8px; } }
+/* presença: quem está online */
+.presence { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.presence.hidden { display: none; }
+.pres-label { font-size: 13px; color: var(--muted-fg); margin-right: 2px; }
+.pres { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 50%; background: var(--ink); color: var(--paper); font-size: 12px; font-weight: 800; cursor: default; }
+.pres.idle { opacity: .45; }
+.pres.editing { outline: 2px solid var(--amber); outline-offset: 1px; }
+.pres-ed { position: absolute; right: -4px; bottom: -4px; display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 50%; background: var(--amber); color: var(--amber-fg); }
 td.cell .pend, td.cell .pub { position: absolute; bottom: 3px; display: inline-flex; color: var(--cta-text); }
 td.cell .pend { right: 4px; } td.cell .pub { left: 4px; }
 td.cell.removed { background: var(--neg-bg); color: var(--neg-fg); }

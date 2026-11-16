@@ -14,6 +14,7 @@ import { openRemovalsCard } from './core/jira.js';
 import { ConflictError, draftView, effectiveCells, staleItems } from './core/drafts.js';
 import { ACTIONS } from './core/audit.js';
 import { createDraftLocks } from './core/locks.js';
+import { createPresence } from './core/presence.js';
 import { defaultTeam, hasAccess, isAdmin, resolveAccessMode, roleFor } from './core/access.js';
 import { daysInMonth, isoDate, localDate, localMonth, planMonth, validateDefinition, verifyPending, verifyStale } from '../shared/rules.js';
 
@@ -35,9 +36,13 @@ async function accessMode() {
   return r.mode;
 }
 const MOCK_AUTH = process.env.MOCK_AUTH !== '0'; // seletor "entrar como..." (só mock)
+// Simular outra pessoa com dados reais, SÓ no seu computador: DEV_IMPERSONATE=1 + ?as=e-mail na URL. O que for gravado fica no nome dessa pessoa.
+const DEV_IMPERSONATE = process.env.DEV_IMPERSONATE === '1' && !MOCK_AUTH;
+const impersonated = new Set();
 
 // Em contêiner (APP_NAME vem do Dockerfile): a identidade só pode vir do ingress e os dados têm de ser os reais.
 if (process.env.APP_NAME) {
+  if (process.env.DEV_IMPERSONATE) throw new Error('DEV_IMPERSONATE não pode existir em produção (qualquer pessoa poderia agir como outra): remova do values.yml.');
   if (process.env.DEV_USER_EMAIL) throw new Error('DEV_USER_EMAIL não pode existir em produção (qualquer pessoa seria vista como esse usuário): remova do values.yml/secrets.');
   if ((process.env.DATA_SOURCE ?? 'mock').toLowerCase() === 'mock') console.warn('[AVISO] Contêiner com DATA_SOURCE=mock (dados de exemplo). Defina DATA_SOURCE=sheets no values.yml.');
 }
@@ -49,6 +54,10 @@ let C = null, ACC = [];
 
 const locks = createDraftLocks(); // trava por rascunho: o checkout não pode rodar duas vezes ao mesmo tempo
 const dkey = (team, month) => `${team}|${month}`;
+// Presença (quem está com o app aberto): só memória; o navegador pinga a cada PRESENCE_PING_SEC e some da lista após PRESENCE_TTL_SEC sem pingar.
+const PRESENCE_PING_SEC = Number(process.env.PRESENCE_PING_SEC ?? 20);
+const presence = createPresence({ ttlMs: Number(process.env.PRESENCE_TTL_SEC ?? 60) * 1000 });
+const PRESENCE_PAGES = ['escalas', 'folgas', 'exportacoes', 'admin'];
 
 class HttpError extends Error { constructor(status, msg, extra = {}) { super(msg); this.status = status; Object.assign(this, extra); } }
 const nowMonth = () => localMonth(); // "hoje" e "mês atual" no fuso do app (-03:00), não em UTC
@@ -70,6 +79,10 @@ const identify = (req) => {
   // `||` (não `??`): o front envia o cabeçalho vazio quando não há "entrar como"; aí vale o DEV_USER_EMAIL local.
   // Local sem "entrar como" (MOCK_AUTH=0): o DEV_USER_EMAIL manda. Senão um valor antigo do seletor, guardado no navegador
   // (localStorage) e enviado pelo front, passaria a valer como identidade. Em produção não há DEV_USER_EMAIL: vale o cabeçalho do proxy.
+  if (DEV_IMPERSONATE) {
+    const as = String(req.headers[IDENTITY_HEADER] || '').trim().toLowerCase();
+    if (/^[^s@]+@[^s@]+.[^s@]+$/.test(as)) { if (!impersonated.has(as)) { impersonated.add(as); console.warn(`[DEV_IMPERSONATE] agindo como ${as} (dados ${repo.kind}); gravações ficam no nome dessa pessoa.`); } return as; }
+  }
   const email = String(!MOCK_AUTH && DEV_USER_EMAIL ? DEV_USER_EMAIL : (req.headers[IDENTITY_HEADER] || DEV_USER_EMAIL || '')).trim().toLowerCase();
   if (!email) throw new HttpError(401, 'Identidade ausente.');
   return email;
@@ -136,6 +149,7 @@ async function checkout(user, args) {
   requireEditor(user, args.team);
   const key = dkey(args.team, args.month);
   const r = await locks.run(key, user, 'confirmando', () => doCheckout(user, args));
+  presence.markEdit(user, args.team, args.month);
   locks.markDone(key, user);
   return r;
 }
@@ -199,6 +213,7 @@ async function api(req, res, url) {
   const m = q.get('month') || nowMonth();
 
   if (req.method === 'GET' && path === '/api/health') return send(res, 200, { status: 'ok' }); // instantâneo: não consulta Sheets nem WFM
+  if (req.method === 'GET' && path === '/api/dev/impersonate') return send(res, 200, { enabled: DEV_IMPERSONATE });
   if (req.method === 'GET' && path === '/api/mock/users') return send(res, 200, MOCK_AUTH ? (await repo.catalog()).logins : []);
   await repo.tick(); // mock: simula o Apps Script (envio de folgas, consolidação de exportações)
   C = await repo.catalog();
@@ -217,6 +232,19 @@ async function api(req, res, url) {
   const user = identify(req);
   if ((await accessMode()) === 'restricted' && !hasAccess(user, actx())) {
     throw new HttpError(403, 'Você ainda não tem acesso a este app. Peça a liberação a quem administra a aba Acessos.', { code: 'no_access' });
+  }
+
+  // ----- presença: o ping já devolve quem está no mesmo time e mês (sem segunda consulta). Não grava nada, não entra no histórico. -----
+  if (req.method === 'POST' && path === '/api/presence') {
+    const b = await readBody(req);
+    const sid = String(b.sid ?? '');
+    if (b.leave) { presence.leave(sid, user); return send(res, 200, { ok: true }); }
+    if (!/^[\w-]{8,64}$/.test(sid)) throw new HttpError(400, 'sid inválido.');
+    const page = PRESENCE_PAGES.includes(b.page) ? b.page : 'escalas';
+    const team = C.teams.some((x) => x.name === b.team) ? b.team : '';
+    const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(String(b.month ?? '')) ? b.month : '';
+    presence.ping({ sid, email: user, page, team, month, visible: b.visible !== false });
+    return send(res, 200, { intervalSec: PRESENCE_PING_SEC, online: presence.users({ team, month, excludeEmail: user }) });
   }
 
   if (req.method === 'GET' && path === '/api/me') {
@@ -246,6 +274,7 @@ async function api(req, res, url) {
     const published = (await baseCellsOf(b.team, b.month)).cells[b.email]?.[b.day] ?? [];
     locks.assertFree(dkey(b.team, b.month)); // não altera o rascunho no meio de um checkout (a edição se perderia ao fechar)
     const d = store.saveDay({ team: b.team, month: b.month, email: b.email, day: b.day, after: b.shifts ?? [], published, user, version: b.version });
+    presence.markEdit(user, b.team, b.month);
     audit.log({ actor: user, team: b.team, month: b.month, action: 'draft.save', agentEmail: b.email, day: b.day, before: published, after: b.shifts ?? [] });
     return send(res, 200, { ok: true, draft: draftView(d) });
   }
@@ -254,6 +283,7 @@ async function api(req, res, url) {
     const team = q.get('team'); requireEditor(user, team);
     locks.assertFree(dkey(team, m));
     const d = store.discardItem({ team, month: m, email: q.get('email'), day: Number(q.get('day')), user, version: q.get('version') });
+    presence.markEdit(user, team, m);
     audit.log({ actor: user, team, month: m, action: 'draft.item.discard', agentEmail: q.get('email'), day: Number(q.get('day')) });
     return send(res, 200, { ok: true, draft: draftView(d) });
   }
@@ -262,6 +292,7 @@ async function api(req, res, url) {
     const team = q.get('team'); requireEditor(user, team);
     locks.assertFree(dkey(team, m));
     const d = store.discard({ team, month: m, version: q.get('version') });
+    presence.markEdit(user, team, m);
     audit.log({ actor: user, team, month: m, action: 'draft.discard', details: `${d?.items.size ?? 0} alteração(ões) descartada(s)` });
     return send(res, 200, { ok: true });
   }
@@ -332,6 +363,7 @@ async function api(req, res, url) {
     }
     locks.assertFree(dkey(b.team, b.month));
     const d = store.replaceAgents({ team: b.team, month: b.month, emails: resolved.map((r) => r.email), entries, user, version: b.version });
+    presence.markEdit(user, b.team, b.month);
     // guarda as configurações (mock da aba GeradorConfig): a próxima abertura do gerador já vem com elas
     const prevCfg = await repo.genConfig.get(b.team); // aplicar só a alguns agentes não pode apagar a configuração dos demais
     await repo.genConfig.set(b.team, { taskId: b.taskId, agents: { ...(prevCfg?.agents ?? {}), ...Object.fromEntries(resolved.map((r) => [r.email, { scaleId: r.scaleId, custom: r.scaleId ? null : r.def }])) }, updatedBy: user });
@@ -435,6 +467,7 @@ async function api(req, res, url) {
   // ----- admin -----
   if (path.startsWith('/api/admin/')) {
     requireAdmin(user);
+    if (req.method === 'GET' && path === '/api/admin/presence') return send(res, 200, { intervalSec: PRESENCE_PING_SEC, sessions: presence.users({ all: true }) });
     if (req.method === 'GET' && path === '/api/admin/access') return send(res, 200, ACC.map((a) => ({ ...a, expired: !!a.validUntil && a.validUntil < today() })));
     if (req.method === 'POST' && path === '/api/admin/access') {
       need('access');
