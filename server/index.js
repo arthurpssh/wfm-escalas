@@ -13,6 +13,7 @@ import { runHealthCheck } from './core/health.js';
 import { openRemovalsCard } from './core/jira.js';
 import { ConflictError, draftView, effectiveCells, staleItems } from './core/drafts.js';
 import { ACTIONS } from './core/audit.js';
+import { createDraftLocks } from './core/locks.js';
 import { defaultTeam, hasAccess, isAdmin, resolveAccessMode, roleFor } from './core/access.js';
 import { daysInMonth, isoDate, localDate, localMonth, planMonth, validateDefinition, verifyPending, verifyStale } from '../shared/rules.js';
 
@@ -45,6 +46,9 @@ const store = repo.drafts;
 const audit = repo.audit;
 // Catálogo (times, agentes, atividades...) e acessos do request corrente: carregados no início de api().
 let C = null, ACC = [];
+
+const locks = createDraftLocks(); // trava por rascunho: o checkout não pode rodar duas vezes ao mesmo tempo
+const dkey = (team, month) => `${team}|${month}`;
 
 class HttpError extends Error { constructor(status, msg, extra = {}) { super(msg); this.status = status; Object.assign(this, extra); } }
 const nowMonth = () => localMonth(); // "hoje" e "mês atual" no fuso do app (-03:00), não em UTC
@@ -127,10 +131,22 @@ async function buildReview(team, month) {
   return { draft: d, items, stale, health, plan, unexpressible };
 }
 
-async function checkout(user, { team, month, version }) {
-  requireEditor(user, team);
+/** Confirma o rascunho. Com a trava, um segundo checkout do mesmo rascunho (outra pessoa ou outra aba) recebe 409 em vez de gerar exportações duplicadas. */
+async function checkout(user, args) {
+  requireEditor(user, args.team);
+  const key = dkey(args.team, args.month);
+  const r = await locks.run(key, user, 'confirmando', () => doCheckout(user, args));
+  locks.markDone(key, user);
+  return r;
+}
+
+async function doCheckout(user, { team, month, version }) {
   const rv = await buildReview(team, month);
-  if (!rv.draft) throw new HttpError(422, 'Não há alterações no rascunho.');
+  if (!rv.draft) {
+    const rec = locks.recent(dkey(team, month));
+    if (rec) throw new HttpError(409, `Este rascunho acabou de ser confirmado por ${rec.user}. Recarregue a página e confira em Exportações.`);
+    throw new HttpError(422, 'Não há alterações no rascunho.');
+  }
   if (Number(version) !== rv.draft.version) throw new ConflictError();
   if (rv.stale.length) throw new HttpError(409, 'Alguns dias foram alterados no WFM depois de entrarem no rascunho. Descarte-os ou reabra o rascunho.', { violations: rv.stale.map((s) => `${s.email} dia ${s.day}`) });
   if (!rv.health.ok) throw new HttpError(422, 'Health check reprovado.', { violations: rv.health.violations.map((v) => v.message) });
@@ -228,6 +244,7 @@ async function api(req, res, url) {
     if (!agent) throw new HttpError(404, 'Agente não pertence ao time.');
     for (const s of b.shifts ?? []) if (s.startTime >= s.endTime) throw new HttpError(422, 'Atividade com duração zero.');
     const published = (await baseCellsOf(b.team, b.month)).cells[b.email]?.[b.day] ?? [];
+    locks.assertFree(dkey(b.team, b.month)); // não altera o rascunho no meio de um checkout (a edição se perderia ao fechar)
     const d = store.saveDay({ team: b.team, month: b.month, email: b.email, day: b.day, after: b.shifts ?? [], published, user, version: b.version });
     audit.log({ actor: user, team: b.team, month: b.month, action: 'draft.save', agentEmail: b.email, day: b.day, before: published, after: b.shifts ?? [] });
     return send(res, 200, { ok: true, draft: draftView(d) });
@@ -235,6 +252,7 @@ async function api(req, res, url) {
   if (req.method === 'DELETE' && path === '/api/draft/item') {
     need('drafts');
     const team = q.get('team'); requireEditor(user, team);
+    locks.assertFree(dkey(team, m));
     const d = store.discardItem({ team, month: m, email: q.get('email'), day: Number(q.get('day')), user, version: q.get('version') });
     audit.log({ actor: user, team, month: m, action: 'draft.item.discard', agentEmail: q.get('email'), day: Number(q.get('day')) });
     return send(res, 200, { ok: true, draft: draftView(d) });
@@ -242,6 +260,7 @@ async function api(req, res, url) {
   if (req.method === 'DELETE' && path === '/api/draft') {
     need('drafts');
     const team = q.get('team'); requireEditor(user, team);
+    locks.assertFree(dkey(team, m));
     const d = store.discard({ team, month: m, version: q.get('version') });
     audit.log({ actor: user, team, month: m, action: 'draft.discard', details: `${d?.items.size ?? 0} alteração(ões) descartada(s)` });
     return send(res, 200, { ok: true });
@@ -311,6 +330,7 @@ async function api(req, res, url) {
       const plan = planMonth(r.def, b.month, b.taskId, C.ctx);
       for (let d = 1; d <= daysInMonth(b.month); d++) entries.push({ email: r.email, day: d, after: plan[d] ?? [], published: base[r.email]?.[d] ?? [] });
     }
+    locks.assertFree(dkey(b.team, b.month));
     const d = store.replaceAgents({ team: b.team, month: b.month, emails: resolved.map((r) => r.email), entries, user, version: b.version });
     // guarda as configurações (mock da aba GeradorConfig): a próxima abertura do gerador já vem com elas
     const prevCfg = await repo.genConfig.get(b.team); // aplicar só a alguns agentes não pode apagar a configuração dos demais

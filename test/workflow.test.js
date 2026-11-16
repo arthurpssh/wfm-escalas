@@ -103,3 +103,36 @@ test('modo de entrada: a Config manda; vazio usa o ambiente; valor inválido FEC
   const typo = resolveAccessMode('restrito', 'open'); // erro de digitação: não pode abrir o acesso
   assert.deepEqual([typo.mode, typo.invalid, typo.source], ['restricted', true, 'planilha (Config)']);
 });
+
+import { createDraftLocks } from '../server/core/locks.js';
+test('trava por rascunho: o 2º checkout simultâneo é barrado (409), a trava sai mesmo com erro e libera depois', async () => {
+  const locks = createDraftLocks();
+  const key = 't@x.com|2026-11';
+  let liberar; const emAndamento = new Promise((ok) => { liberar = ok; });
+  let criadas = 0;
+  const checkout = (user) => locks.run(key, user, 'confirmando', async () => { await emAndamento; criadas++; return user; }); // simula a gravação lenta na planilha
+  const a = checkout('arthur@x.com'); // começa e fica "gravando"
+  const b = checkout('ramon@x.com'); // 130 ms depois, na vida real
+  await assert.rejects(b, (e) => e.status === 409 && /arthur@x.com está confirmando este rascunho agora/.test(e.message));
+  assert.throws(() => locks.assertFree(key), (e) => e.status === 409); // edições também esperam
+  assert.equal(locks.isLocked(key), true);
+  liberar();
+  assert.equal(await a, 'arthur@x.com');
+  assert.equal(criadas, 1); // só UMA exportação teria sido gerada
+  assert.equal(locks.isLocked(key), false);
+  locks.assertFree(key); // livre de novo
+  await assert.rejects(locks.run(key, 'x', 'confirmando', async () => { throw new Error('falhou'); }), /falhou/);
+  assert.equal(locks.isLocked(key), false); // erro não deixa a trava presa
+  assert.equal(await locks.run(key, 'y', 'confirmando', async () => 'ok'), 'ok');
+  assert.equal(locks.isLocked('outro|2026-11'), false); // outro rascunho não é afetado
+});
+
+test('trava: "acabou de ser confirmado por X" só vale por alguns minutos', () => {
+  let t = 0;
+  const locks = createDraftLocks({ now: () => t, recentMs: 5 * 60_000 });
+  assert.equal(locks.recent('k'), null);
+  locks.markDone('k', 'arthur@x.com');
+  assert.equal(locks.recent('k').user, 'arthur@x.com');
+  t = 5 * 60_000 + 1;
+  assert.equal(locks.recent('k'), null);
+});
