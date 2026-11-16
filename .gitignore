@@ -1,0 +1,45 @@
+# Dependências
+node_modules/
+
+# Variáveis de ambiente (CRÍTICO PARA SEGURANÇA): só o exemplo é versionado
+.env
+.env.*
+!.env.example
+
+# Chaves e credenciais
+credentials.json
+client_secret.json
+token.json
+*-key.json
+service-account.json
+gcp-*.json
+
+# Dados reais e arquivos de trabalho (nomes, e-mails, escalas)
+response.json
+teste.json
+planilha/usuarios-pendentes.xlsx
+
+# Logs, caches, sistema operacional, editores
+logs/
+*.log
+npm-debug.log*
+.npm
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
+*.bak
+
+# Pacote para o Magic Deploy
+*.zip
+
+# Pastas e documentos
+# Não fazem parte do que roda em produção: documentação, template e gerador da planilha, arquivos de apoio.
+# (O que vai no repositório: server/, shared/, public/, package*.json, Dockerfile, values.yml, .dockerignore,
+#  .github/, .env.example e test/, que o workflow executa com `npm test`.)
+docs/
+planilha/
+README.md
+CLAUDE.md

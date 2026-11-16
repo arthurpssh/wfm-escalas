@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin · Gestão de escalas</title>
+  <link rel="stylesheet" href="https://static.hotmart.com/fonts/v1/css/hotmart-sans.min.css">
+  <link rel="stylesheet" href="https://static.hotmart.com/fonts/v1/css/hotmart-display.min.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/escalas"><img class="brand-logo" src="/img/hotmart-logo-color-negative.png" alt="Hotmart"><span class="brand-title">Gestão de escalas</span></a>
+    <nav id="nav" class="nav"></nav>
+    <div class="spacer"></div>
+    <label class="mock-login">entrar como <select id="mockUser"></select></label>
+  </header>
+  <div class="admin-wrap" style="padding-top:16px">
+    <div id="denied" class="banner hidden" style="margin:0 -24px">Esta página é restrita a administradores (papel <b>admin</b> na aba Acessos).</div>
+    <div id="content" class="hidden">
+      <div class="tabs">
+        <button data-tab="estatisticas" class="active">Estatísticas</button>
+        <button data-tab="historico">Histórico</button>
+        <button data-tab="acessos">Acessos</button>
+      </div>
+      <section id="tab-estatisticas"></section>
+      <section id="tab-historico" class="hidden"></section>
+      <section id="tab-acessos" class="hidden"></section>
+    </div>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="/admin.js"></script>
+</body>
+</html>

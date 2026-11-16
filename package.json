@@ -1,0 +1,14 @@
+{
+  "name": "wfm-escalas",
+  "version": "0.1.0",
+  "description": "Gestão de escalas e folgas para supervisores (mock) - espelho paralelo ao Tymeshift/Zendesk WFM",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "dev": "node --env-file-if-exists=.env --watch server/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.9"
+  }
+}

@@ -1,0 +1,58 @@
+name: wfm-escalas
+
+containerPort: 3001
+cpu: 0.25
+memory: 512Mi
+
+# NÃO aumentar sem antes mover o estado para fora da memória: rascunhos, histórico e exportações vivem na memória do processo
+# (gravados na planilha em lote) e a ordem das escritas depende de haver uma única instância.
+replicaCount: 1
+
+# Instantâneo: não consulta Sheets nem WFM.
+healthCheckPath: /api/health
+periodSeconds: 30
+timeoutSeconds: 5
+successThreshold: 2
+failureThreshold: 5
+
+env:
+  PROFILE: staging
+  PORT: "3001"
+  NEW_RELIC_ENABLED: "false"
+
+  # --- dados reais, com escrita (rascunhos, gerador, histórico, checkout, folgas, acessos) ---
+  DATA_SOURCE: "sheets"
+  SHEETS_WRITE: "1"
+  SHEETS_CACHE_SEC: "60"
+  # Seletor "entrar como..." só existe no mock; em produção a identidade vem do cabeçalho do ingress.
+  MOCK_AUTH: "0"
+  # NUNCA definir DEV_USER_EMAIL aqui (o app recusa subir com ele em contêiner).
+  # Quem pode entrar (open | restricted) é definido na aba Config da planilha (linha access_mode); sem ela vale ACCESS_MODE (padrão open).
+
+  # --- secrets (um secretKeyRef por segredo; nome = {app}-{nome-em-kebab}) ---
+  GOOGLE_CLIENT_EMAIL:
+    secretKeyRef:
+      name: wfm-escalas-google-client-email
+      key: GOOGLE_CLIENT_EMAIL
+  GOOGLE_PRIVATE_KEY:
+    secretKeyRef:
+      name: wfm-escalas-google-private-key
+      key: GOOGLE_PRIVATE_KEY
+  SHEETS_SPREADSHEET_ID:
+    secretKeyRef:
+      name: wfm-escalas-sheets-spreadsheet-id
+      key: SHEETS_SPREADSHEET_ID
+
+lb:
+  type: internal
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "https://auth.hotmart.run/verify"
+    nginx.ingress.kubernetes.io/auth-signin: "https://auth.hotmart.run/login?rd=https://$host$request_uri"
+    nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-Request-Email,X-Auth-Request-User"
+  hosts:
+  - host: wfm-escalas.hotmart.run
+    paths: ["/"]
+
+imports:
+- to: module.base-module.aws_ecr_repository.application-default-ecr[0]
+  id: "wfm-escalas"

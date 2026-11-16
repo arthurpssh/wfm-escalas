@@ -1,0 +1,14 @@
+.git
+.github
+node_modules
+docs
+test
+planilha
+.env
+.env.*
+!.env.example
+*.xlsx
+*.md
+response.json
+teste.json
+Dockerfile

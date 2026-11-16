@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Exportações · Gestão de escalas</title>
+  <link rel="stylesheet" href="https://static.hotmart.com/fonts/v1/css/hotmart-sans.min.css">
+  <link rel="stylesheet" href="https://static.hotmart.com/fonts/v1/css/hotmart-display.min.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/escalas"><img class="brand-logo" src="/img/hotmart-logo-color-negative.png" alt="Hotmart"><span class="brand-title">Gestão de escalas</span></a>
+    <nav id="nav" class="nav"></nav>
+    <div class="spacer"></div>
+    <label class="mock-login" title="Somente no mock">entrar como <select id="mockUser"></select></label>
+  </header>
+
+  <div class="toolbar">
+    <select id="teamSelect" title="Time"></select>
+    <label class="inline-label">Status
+      <select id="statusFilter">
+        <option value="">todos</option>
+        <option value="open">pendentes de publicação</option>
+        <option value="aguardando_verificacao">aguardando publicação</option>
+        <option value="nao_publicada">importada, não publicada</option>
+        <option value="divergente">divergente</option>
+        <option value="consolidada">consolidada</option>
+        <option value="expirada">expirada</option>
+      </select>
+    </label>
+  </div>
+  <div id="roleBanner" class="banner hidden"></div>
+
+  <div class="admin-wrap">
+    <div class="note-box">
+      <b>Como funciona:</b> baixe o CSV, <b>importe</b> no Tymeshift e <b>publique em seguida</b>. Depois clique em <b>Já publiquei</b> para verificar agora se o publicado reflete o arquivo. Sem o clique, o sistema verifica sozinho mais tarde. Enquanto está pendente, os dias aparecem com o ícone de envio na escala.
+    </div>
+    <div class="panel-card"><div id="list"></div></div>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="/exportacoes.js"></script>
+</body>
+</html>
