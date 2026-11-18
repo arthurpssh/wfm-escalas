@@ -32,6 +32,7 @@ export async function api(url, opts = {}) {
   if (!r.ok) {
     const j = await r.json().catch(() => ({}));
     if (r.status === 403 && j.code === 'no_access') showNoAccess(j.error);
+    if (r.status === 403 && j.code === 'agent_only' && !location.pathname.startsWith('/minha-escala')) location.replace('/minha-escala');
     const e = new Error(j.error ?? r.statusText); e.status = r.status; e.violations = j.violations; throw e;
   }
   return r;
@@ -85,19 +86,27 @@ export const recallView = () => { try { return { team: sessionStorage.getItem('w
 /** Navegação entre as páginas. active: 'escalas' | 'folgas' | 'exportacoes' | 'admin' */
 export function renderNav(active, me) {
   const nav = $('#nav'); if (!nav) return;
+  // Agente sem papel de supervisão (portal ligado): só existe "Minha escala". Qualquer outra página manda para lá.
+  if (me?.agentOnly) {
+    if (active !== 'agente') { location.replace('/minha-escala'); return; }
+    nav.innerHTML = '<a href="/minha-escala" class="active">Minha escala</a>';
+    return;
+  }
   const { team, month } = recallView();
   const enc = (t) => encodeURIComponent(t).replace(/%40/g, '@');
   const links = [
     ['escalas', 'Escala', team && month ? `/escalas/${enc(team)}/${month}` : '/escalas'],
+    ['trocas', 'Trocas', team && month ? `/trocas/${enc(team)}/${month}` : '/trocas'],
     ['folgas', 'Folgas', team && month ? `/folgas/${enc(team)}/${month}` : '/folgas'],
     ['exportacoes', 'Exportações', team ? `/exportacoes/${enc(team)}` : '/exportacoes'],
   ];
+  if (me?.isAgent && (me.portal || me.isAdmin)) links.push(['agente', 'Minha escala', '/minha-escala']); // supervisor/admin que também é agente
   if (me?.isAdmin) links.push(['admin', 'Admin', '/admin']);
   nav.innerHTML = links.map(([k, label, href]) => `<a href="${href}" class="${k === active ? 'active' : ''}">${label}</a>`).join('');
 }
 
 // ---------- presença: quem está com o app aberto ----------
-const PAGE_LABEL = { escalas: 'na escala', folgas: 'em Folgas', exportacoes: 'em Exportações', admin: 'no Admin' };
+const PAGE_LABEL = { escalas: 'na escala', trocas: 'em Trocas', folgas: 'em Folgas', exportacoes: 'em Exportações', admin: 'no Admin' };
 const minAgo = (iso) => Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60000));
 const initials = (name) => name.split(' ').filter(Boolean).slice(0, 2).map((p) => p[0]).join('').toUpperCase();
 

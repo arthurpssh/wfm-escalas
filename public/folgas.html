@@ -24,11 +24,23 @@
       <button id="nextMonth" title="Próximo mês" aria-label="Próximo mês"><svg class="ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
     </div>
     <input type="search" id="filter" placeholder="Filtrar agente…">
+    <button id="addLot" class="primary hidden">Adicionar folga</button>
     <div id="presence" class="presence hidden"></div>
   </div>
   <div id="roleBanner" class="banner hidden"></div>
 
   <div class="admin-wrap">
+    <section class="panel-card" id="holidayCard">
+      <h3>Feriados do mês</h3>
+      <p class="hint" style="margin:0 0 12px" id="holidayHint">Clique em um feriado para criar as folgas de quem trabalha nesse dia.</p>
+      <div id="holidays" class="chips"></div>
+    </section>
+
+    <section class="panel-card" id="lotCard">
+      <h3>Lotes de folga</h3>
+      <div id="lots"></div>
+    </section>
+
     <section class="panel-card">
       <h3>Solicitações dos agentes <span id="reqCount" class="badge tf-pendente"></span></h3>
       <p class="hint" style="margin:0 0 12px">Pedidos feitos pelos próprios agentes e ainda sem decisão. Enquanto não forem aceitos, <b>não contam</b> na cobertura da escala.</p>
@@ -47,6 +59,7 @@
       <div id="list"></div>
     </section>
   </div>
+  <div id="modal" class="modal hidden"></div>
   <div id="toast" class="toast hidden"></div>
   <script type="module" src="/folgas.js"></script>
 </body>

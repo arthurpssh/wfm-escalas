@@ -10,7 +10,9 @@
 //   settings()                aba Config como { chave: valor } (sheets; mock = {}): ex.: access_mode
 //   cells(month)              { [email]: { [dia]: Shift[] } }  — publicado, extraído do WFM
 //   applyExpected(month, expected)   só mock (em produção, quem atualiza o publicado é a extração do Apps Script)
-//   timeoffs.list(month) / get(id) / add(t) / update(id, patch) / remove(id)
+//   timeoffs.list(month) / get(id) / add(t) / addMany(list) / update(id, patch) / remove(id) / removeMany(ids) / lots()   (lote = folgas com o mesmo loteId; lots() devolve [{ loteId, items[] }] com status agendada | enviada | erro | cancelada)
+//   swaps.list() / get(id) / add(s) / update(id, patch)   trocas de dia extra (aba Trocas, dona: o app)
+//   holidays.list()           [{ date, name, type, source, team }] (sheets: aba Feriados, só leitura; mock: feriados nacionais fixos)
 //   access.list() / add(row) / remove(id)
 //   batches.list() / add(b)
 //   exports.list() / get(id) / add(e) / addMany(list) / update(id, patch) / csvOf(e)   (sheets: o CSV vai para o Drive se houver DRIVE_FOLDER_ID, senão para a aba Arquivos)
@@ -29,7 +31,7 @@ export async function createRepo(env = process.env) {
   const source = (env.DATA_SOURCE ?? 'mock').toLowerCase();
   if (source === 'mock') return createMockRepo({ consolidateAfterSec: Number(env.CONSOLIDATE_AFTER_SEC ?? 0) });
   if (source === 'sheets') {
-    const repo = createSheetsRepo({ gateway: createSheetsGateway(env), cacheSec: Number(env.SHEETS_CACHE_SEC ?? 60) });
+    const repo = createSheetsRepo({ gateway: createSheetsGateway(env), cacheSec: Number(env.SHEETS_CACHE_SEC ?? 60), catalogCacheSec: Number(env.SHEETS_CATALOG_CACHE_SEC ?? 300) });
     const r = await repo.init();
     console.log('[sheets]', r.writable ? `escrita ligada · ${r.drafts} rascunho(s), ${r.exports} exportação(ões), ${r.batches} lote(s), ${r.historyEntries} registro(s) de histórico carregados · arquivos: ${env.DRIVE_FOLDER_ID ? 'Drive' : 'aba Arquivos da planilha'}` : 'somente leitura (SHEETS_WRITE não definido)');
     return repo;

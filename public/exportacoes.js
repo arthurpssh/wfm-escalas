@@ -2,7 +2,7 @@ import { withIcon } from '/icons.js';
 import { $, esc, api, getJson, toast, setupMockLogin, fmtTs, renderNav, rememberView, recallView, startPresence, renderPresence } from '/common.js';
 
 const ST = {
-  aguardando_verificacao: 'aguardando publicação', nao_publicada: 'importada, não publicada', divergente: 'divergente',
+  aguardando_verificacao: 'aguardando conferência', nao_publicada: 'importada, não publicada', divergente: 'divergente',
   consolidada: 'consolidada', expirada: 'expirada',
 };
 const OPEN = ['aguardando_verificacao', 'nao_publicada', 'divergente'];

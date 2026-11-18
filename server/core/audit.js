@@ -1,5 +1,5 @@
 // Histórico (log só de inclusão), uma "aba" por mês: Histórico YYYY-MM.
-export const ACTIONS = ['draft.save', 'draft.generate', 'draft.discard', 'draft.item.discard', 'checkout', 'timeoff.create', 'timeoff.update', 'timeoff.delete', 'timeoff.approve', 'timeoff.deny', 'timeoff.erro_envio', 'export.verify', 'export.download', 'access.grant', 'access.revoke', 'jira.card'];
+export const ACTIONS = ['draft.save', 'draft.generate', 'draft.discard', 'draft.item.discard', 'checkout', 'timeoff.create', 'timeoff.request', 'timeoff.request.cancel', 'swap.request', 'swap.respond', 'swap.cancel', 'swap.consolidate', 'swap.deny', 'swap.invalidate', 'timeoff.update', 'timeoff.delete', 'timeoff.approve', 'timeoff.deny', 'timeoff.erro_envio', 'export.verify', 'export.download', 'access.grant', 'access.revoke', 'jira.card'];
 
 export function createAudit() {
   const byMonth = new Map(); // 'YYYY-MM' -> entries[]

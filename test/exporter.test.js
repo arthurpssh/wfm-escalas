@@ -75,3 +75,53 @@ test('padrão: alterações distantes continuam em UM arquivo, reemitindo os dia
   assert.equal(files[0].days, 16);
   assert.equal(files[0].reemitted, 4); // dias 6..9 do agente A (base) reemitidos sem alteração
 });
+
+// ---------- etapa A: turno até 24:00 põe o dia seguinte na janela (teste O da Fase 0) ----------
+const night = { ...cfg, entry: 840, lunch: null, snack: 1200, snackDur: 45, exit: 1440 }; // 14:00 a 24:00
+
+test('turno que termina às 24:00: o dia seguinte entra na janela e é reemitido (senão o import o apaga)', () => {
+  const { files, errors, warnings } = planExports({ ...common, items: [item(A, 7, day(7, night))] });
+  assert.deepEqual(errors, []);
+  assert.equal(files.length, 1);
+  assert.deepEqual(files[0].window, { from: '2027-04-07', to: '2027-04-08' }); // o dia 8 entrou
+  assert.equal(files[0].days, 2);
+  const lines = files[0].csv.split('\r\n').slice(1).filter(Boolean).map((l) => l.split(','));
+  assert.ok(lines.some((l) => l[7].startsWith('2027-04-08T00:00:00'))); // o fim às 24:00
+  assert.ok(lines.some((l) => l[6].startsWith('2027-04-08T09:00:00'))); // o dia 8 reemitido com o conteúdo de antes
+  assert.equal(files[0].reemitted, 1);
+  assert.deepEqual(Object.keys(files[0].expected[A.email]).map(Number), [7, 8]); // a verificação confere os dois dias
+  assert.ok(warnings.some((w) => w.includes('termina às 24:00')));
+});
+
+test('24:00 encadeado: se o dia seguinte também termina às 24:00, o seguinte a ele também entra', () => {
+  const withNight8 = { ...base, [A.email]: { ...base[A.email], 8: day(8, night) } };
+  const { files, errors } = planExports({ ...common, baseCells: withNight8, items: [item(A, 7, day(7, night))] });
+  assert.deepEqual(errors, []);
+  assert.deepEqual(files[0].window, { from: '2027-04-07', to: '2027-04-09' });
+});
+
+test('24:00 sem escala no dia seguinte: nada a reemitir, mas a janela ainda inclui o dia', () => {
+  const noDay10 = { ...base, [A.email]: { ...base[A.email] } };
+  const { files } = planExports({ ...common, baseCells: noDay10, items: [item(A, 9, day(9, night))] });
+  assert.deepEqual(files[0].window, { from: '2027-04-09', to: '2027-04-10' });
+  assert.equal(files[0].reemitted, 0);
+});
+
+test('último dia do mês até 24:00: reemite o dia 1 do mês seguinte (fora da verificação do mês); sem leitura dele, é erro', () => {
+  const d30 = (c) => configToShifts(c, '2027-04-30', CTX);
+  const may1 = configToShifts(cfg, '2027-05-01', CTX);
+  const b30 = { [A.email]: { 30: d30(cfg) } };
+  const it30 = { email: A.email, day: 30, kind: 'edited', before: b30[A.email][30], after: d30(night) };
+  const ok = planExports({ ...common, baseCells: b30, nextMonthFirst: { [A.email]: may1 }, items: [it30] });
+  assert.deepEqual(ok.errors, []);
+  assert.deepEqual(ok.files[0].window, { from: '2027-04-30', to: '2027-05-01' });
+  assert.deepEqual(Object.keys(ok.files[0].expected[A.email]).map(Number), [30]); // só dias do mês
+  assert.ok(ok.files[0].csv.includes('2027-05-01T09:00:00-03:00'));
+  const bad = planExports({ ...common, baseCells: b30, nextMonthFirst: null, items: [it30] });
+  assert.ok(bad.errors.some((e) => e.includes('dia 1 do mês seguinte')));
+});
+
+test('turno que termina antes da meia-noite não muda a janela (comportamento de antes)', () => {
+  const { files } = planExports({ ...common, items: [item(A, 7, day(7, { ...cfg, exit: 1439, snack: 950 }))] }); // 23:59
+  assert.deepEqual(files[0].window, { from: '2027-04-07', to: '2027-04-07' });
+});

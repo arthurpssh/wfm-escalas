@@ -19,6 +19,7 @@ response.json
 teste.json
 planilha/usuarios-pendentes.xlsx
 
+
 # Logs, caches, sistema operacional, editores
 logs/
 *.log
@@ -43,3 +44,4 @@ docs/
 planilha/
 README.md
 CLAUDE.md
+*.xlsx

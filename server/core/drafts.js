@@ -38,6 +38,26 @@ export function createDraftStore() {
     },
 
     /**
+     * Grava o "depois" de VÁRIOS dias do mesmo agente de uma vez (a mesma configuração aplicada em um intervalo): uma só checagem e uma só
+     * subida de versão. `entries`: [{ day, after, published }]. Dia que volta a ser igual ao publicado deixa de ser alteração.
+     */
+    saveDays({ team, month, email, entries, user, version, now = new Date().toISOString() }) {
+      const key = draftKey(team, month);
+      checkVersion(key, version);
+      let d = drafts.get(key);
+      if (!d) { d = { key, team, month, version: 0, status: 'open', openedBy: user, openedAt: now, updatedBy: user, updatedAt: now, items: new Map() }; drafts.set(key, d); }
+      for (const { day, after, published } of entries) {
+        const ik = itemKey(email, day);
+        const before = d.items.get(ik)?.before ?? published ?? [];
+        if (sameShifts(after, before)) d.items.delete(ik);
+        else d.items.set(ik, { email, day, kind: !before.length ? 'created' : !after.length ? 'removed' : 'edited', before, after, updatedBy: user, updatedAt: now });
+      }
+      d.version += 1; d.updatedBy = user; d.updatedAt = now;
+      if (!d.items.size) { drafts.delete(key); return null; }
+      return d;
+    },
+
+    /**
      * Substitui, de uma vez, as definições de vários agentes no mês: apaga os itens anteriores desses agentes no rascunho
      * e grava só o que difere do publicado. `entries`: [{ email, day, after, published }] cobrindo TODOS os dias do mês
      * dos agentes envolvidos (dia sem turno = after []). Uma única subida de versão.

@@ -14,9 +14,14 @@ import { openRemovalsCard } from './core/jira.js';
 import { ConflictError, draftView, effectiveCells, staleItems } from './core/drafts.js';
 import { ACTIONS } from './core/audit.js';
 import { createDraftLocks } from './core/locks.js';
-import { createPresence } from './core/presence.js';
-import { defaultTeam, hasAccess, isAdmin, resolveAccessMode, roleFor } from './core/access.js';
-import { daysInMonth, isoDate, localDate, localMonth, planMonth, validateDefinition, verifyPending, verifyStale } from '../shared/rules.js';
+import { createPresence, displayName } from './core/presence.js';
+import { buildPortalSchedule, cancelableByAgent, ownTimeoffs } from './core/portal.js';
+import { extraDays } from './core/extras.js';
+import { STATUS_LABEL as SWAP_LABEL, OPEN as SWAP_OPEN, expiredIds, swapOps, swapWarnings, validateSwap } from './core/swaps.js';
+import { notifySwap } from './core/notify.js';
+import { defaultTeam, hasAccess, isAdmin, isEmail, resolveAccessMode, resolvePortal, roleFor } from './core/access.js';
+import { addDaysIso, checkConfig, daysInMonth, isoDate, localDate, localMonth, parseWeekdays, planMonth, shiftsToConfig, toLocalIso, validateDefinition, verifyPending, verifyStale, weekdayDigit } from '../shared/rules.js';
+import { holidaysFor } from './data/holidays.js';
 
 const ROOT = join(fileURLToPath(import.meta.url), '..', '..');
 const PORT = Number(process.env.PORT) || 3000;
@@ -34,6 +39,22 @@ async function accessMode() {
   const key = `${r.mode}|${r.source}|${r.invalid}`;
   if (key !== lastAccessMode) { lastAccessMode = key; console.log(`[acesso] modo ${r.mode.toUpperCase()} (${r.source})${r.invalid ? ' · VALOR INVÁLIDO em Config.access_mode: usando restricted por segurança' : ''}`); }
   return r.mode;
+}
+// Portal do agente: aba Config (agent_portal) manda; AGENT_PORTAL do ambiente é o padrão (off). Desligado, nada muda para ninguém.
+const ENV_AGENT_PORTAL = process.env.AGENT_PORTAL ?? 'off';
+let lastPortal = null;
+async function portalState() {
+  const r = resolvePortal((await repo.settings()).agent_portal, ENV_AGENT_PORTAL);
+  const key = `${r.on}|${r.source}|${r.invalid}`;
+  if (key !== lastPortal) { lastPortal = key; console.log(`[portal] ${r.on ? 'LIGADO' : 'desligado'} (${r.source})${r.invalid ? ' · VALOR INVÁLIDO em Config.agent_portal: mantido desligado' : ''}`); }
+  return r;
+}
+/** Quem é a pessoa para o portal: agente de algum time? tem papel de supervisão? Só agente sem papel (e portal ligado) vê SÓ o portal. */
+async function portalCtx(user) {
+  const st = await portalState(), e = user.toLowerCase();
+  const agent = C.agents.find((a) => a.email.toLowerCase() === e) ?? null;
+  const staff = isAdmin(user, actx()) || hasAccess(user, actx()) || C.teams.some((t) => roleFor(user, t, actx()) === 'editor');
+  return { on: st.on, agent, staff, agentOnly: st.on && !!agent && !staff };
 }
 const MOCK_AUTH = process.env.MOCK_AUTH !== '0'; // seletor "entrar como..." (só mock)
 // Simular outra pessoa com dados reais, SÓ no seu computador: DEV_IMPERSONATE=1 + ?as=e-mail na URL. O que for gravado fica no nome dessa pessoa.
@@ -57,7 +78,7 @@ const dkey = (team, month) => `${team}|${month}`;
 // Presença (quem está com o app aberto): só memória; o navegador pinga a cada PRESENCE_PING_SEC e some da lista após PRESENCE_TTL_SEC sem pingar.
 const PRESENCE_PING_SEC = Number(process.env.PRESENCE_PING_SEC ?? 20);
 const presence = createPresence({ ttlMs: Number(process.env.PRESENCE_TTL_SEC ?? 60) * 1000 });
-const PRESENCE_PAGES = ['escalas', 'folgas', 'exportacoes', 'admin'];
+const PRESENCE_PAGES = ['escalas', 'trocas', 'folgas', 'exportacoes', 'admin'];
 
 class HttpError extends Error { constructor(status, msg, extra = {}) { super(msg); this.status = status; Object.assign(this, extra); } }
 const nowMonth = () => localMonth(); // "hoje" e "mês atual" no fuso do app (-03:00), não em UTC
@@ -81,7 +102,7 @@ const identify = (req) => {
   // (localStorage) e enviado pelo front, passaria a valer como identidade. Em produção não há DEV_USER_EMAIL: vale o cabeçalho do proxy.
   if (DEV_IMPERSONATE) {
     const as = String(req.headers[IDENTITY_HEADER] || '').trim().toLowerCase();
-    if (/^[^s@]+@[^s@]+.[^s@]+$/.test(as)) { if (!impersonated.has(as)) { impersonated.add(as); console.warn(`[DEV_IMPERSONATE] agindo como ${as} (dados ${repo.kind}); gravações ficam no nome dessa pessoa.`); } return as; }
+    if (isEmail(as)) { if (!impersonated.has(as)) { impersonated.add(as); console.warn(`[DEV_IMPERSONATE] agindo como ${as} (dados ${repo.kind}); gravações ficam no nome dessa pessoa.`); } return as; }
   }
   const email = String(!MOCK_AUTH && DEV_USER_EMAIL ? DEV_USER_EMAIL : (req.headers[IDENTITY_HEADER] || DEV_USER_EMAIL || '')).trim().toLowerCase();
   if (!email) throw new HttpError(401, 'Identidade ausente.');
@@ -96,7 +117,8 @@ const teamTimeoffs = async (team, m) => {
   const timeoffs = await repo.timeoffs.list(m);
   const emails = new Set(agentsOf(team).map((a) => a.email));
   const first = `${m}-01`, last = `${m}-${dd(daysInMonth(m))}`;
-  return timeoffs.filter((t) => emails.has(t.email) && isoDate(t.startTime) <= last && isoDate(t.endTime) >= first);
+  // pedido do agente ainda na carência (não foi ao WFM) é só do agente: o supervisor passa a ver depois do envio
+  return timeoffs.filter((t) => emails.has(t.email) && !(t.request && t.status === 'agendada') && isoDate(t.startTime) <= last && isoDate(t.endTime) >= first);
 };
 
 function validateTimeoff(b) {
@@ -104,6 +126,80 @@ function validateTimeoff(b) {
   if (!C.reasons.find((r) => r.taskId === b.reasonId)) return 'Razão inexistente.';
   if (!b.startTime || !b.endTime || b.startTime >= b.endTime) return 'Período inválido (fim deve ser depois do início).';
   return null;
+}
+/** Dias da semana da escala padrão de cada agente do time (a do gerador, se o supervisor escolheu outra). Base dos dias extras. */
+async function weekdaysOfTeam(team) {
+  return Object.fromEntries(agentsOf(team).map((a) => [a.email, a.def?.weekdays ?? '']));
+}
+
+/**
+ * Contexto para validar trocas e calcular avisos: escala (publicada + exportações a consolidar) dos meses em volta das datas, folgas que valem
+ * (aprovadas ou agendadas) e trocas em aberto do time. `dates`: datas 'YYYY-MM-DD' envolvidas.
+ */
+async function swapContext(team, dates) {
+  const months = [...new Set(dates.flatMap((d) => [addDaysIso(d, -8), d, addDaysIso(d, 8)].map((x) => x.slice(0, 7))))];
+  const cells = {}, tos = new Map();
+  for (const mo of months) {
+    cells[mo] = (await baseCellsOf(team, mo)).cells;
+    for (const t of await repo.timeoffs.list(mo)) tos.set(t.id, t);
+  }
+  const wd = await weekdaysOfTeam(team);
+  const active = [...tos.values()].filter((t) => ['aprovada', 'agendada'].includes(t.status));
+  return {
+    today: localDate(), team: new Set(agentsOf(team).map((a) => a.email)),
+    shiftsOn: (email, date) => cells[date.slice(0, 7)]?.[email]?.[Number(date.slice(8, 10))] ?? [],
+    weekdaysOf: (email) => wd[email] ?? '',
+    timeoffOn: (email, date) => active.some((t) => t.email === email && isoDate(toLocalIso(t.startTime)) <= date && isoDate(toLocalIso(t.endTime)) >= date),
+    openSwaps: (await repo.swaps.list()).filter((s) => s.team === team),
+  };
+}
+/** Troca em aberto cujo dia chegou vira "expirada" (feito na hora de listar). */
+async function expireSwaps() {
+  const list = await repo.swaps.list();
+  for (const id of expiredIds(list, localDate())) await repo.swaps.update(id, { status: 'expirada', updatedAt: new Date().toISOString() });
+}
+const swapDates = (s) => [s.date, s.offerDate].filter(Boolean);
+const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ''));
+
+const LOT_MAX = 300; // agentes por lote
+
+/**
+ * Prévia de um lote de folgas: por agente do time, se tem turno no período, se a escala padrão dele cai no período e quais folgas já se sobrepõem
+ * (agendadas, pendentes ou aprovadas). A tela usa isso para sugerir quem marcar e avisar de conflitos; quem decide é o supervisor.
+ */
+async function lotPreview(team, startTime, endTime) {
+  const s0 = toLocalIso(startTime), s1 = toLocalIso(endTime);
+  const d0 = s0.slice(0, 10), d1 = s1.slice(0, 10);
+  const dates = [];
+  for (let d = d0; d <= d1; d = addDaysIso(d, 1)) { dates.push(d); if (dates.length > 366) throw new HttpError(422, 'Período longo demais (máximo de 1 ano).'); }
+  const months = [...new Set(dates.map((d) => d.slice(0, 7)))];
+  const cells = {};
+  for (const mo of months) cells[mo] = (await baseCellsOf(team, mo)).cells;
+  const seen = new Map();
+  for (const mo of months) for (const t of await repo.timeoffs.list(mo)) seen.set(t.id, t);
+  const ACTIVE = new Set(['agendada', 'pendente', 'aprovada']);
+  const mine = [...seen.values()].filter((t) => ACTIVE.has(t.status) && toLocalIso(t.startTime) < s1 && toLocalIso(t.endTime) > s0);
+  return agentsOf(team).map((a) => {
+    const wd = parseWeekdays(a.def?.weekdays);
+    const stdWorks = wd.size ? dates.some((d) => wd.has(weekdayDigit(d))) : null; // null = sem escala padrão cadastrada
+    const shiftDays = dates.filter((d) => (cells[d.slice(0, 7)]?.[a.email]?.[Number(d.slice(8, 10))] ?? []).length).length;
+    const conflicts = mine.filter((t) => t.email === a.email).map((t) => ({ id: t.id, reasonName: t.reasonName, status: t.status, startTime: t.startTime, endTime: t.endTime }));
+    return { email: a.email, name: a.name, hasShift: shiftDays > 0, shiftDays, stdWorks, conflicts };
+  });
+}
+
+/** Resumo de um lote para a tela. */
+function lotView(lot) {
+  const it = lot.items, first = it[0];
+  const count = (s) => it.filter((i) => i.status === s).length;
+  const pending = it.filter((i) => i.status === 'agendada').map((i) => i.scheduledAt).filter(Boolean).sort();
+  return {
+    loteId: lot.loteId, createdBy: first.createdBy, createdAt: first.createdAt, reasonName: first.reasonName,
+    startTime: first.startTime, endTime: first.endTime, total: it.length,
+    agendada: count('agendada'), enviada: count('enviada'), erro: count('erro'), cancelada: count('cancelada'),
+    nextSendAt: pending[0] ?? null, agents: it.map((i) => i.email),
+    errors: it.filter((i) => i.status === 'erro').slice(0, 5).map((i) => ({ email: i.email, note: i.note })),
+  };
 }
 const schedulePending = () => new Date(Date.now() + GRACE_MIN * 60_000).toISOString();
 
@@ -129,6 +225,30 @@ async function baseCellsOf(team, month) {
   return { cells: out, pending: Object.fromEntries(Object.entries(pending).map(([k, v]) => [k, [...v]])) };
 }
 
+/** Avisos de regra (não bloqueiam) dos dias do rascunho, calculados no servidor com as mesmas regras do navegador. */
+function configWarnings(items) {
+  const ctx = { lunch: C.ctx.lunch, snack: C.ctx.snack, tasks: new Map(C.activities.map((a) => [a.taskId, a])) };
+  const out = [];
+  for (const i of items) {
+    if (!i.after?.length) continue;
+    const { config, irregular } = shiftsToConfig(i.after, ctx);
+    if (!config || irregular) continue;
+    const { avisos } = checkConfig(config);
+    if (avisos.length) out.push({ email: i.email, agentName: C.agents.find((a) => a.email === i.email)?.name, day: i.day, avisos });
+  }
+  return out;
+}
+
+/** Dia 1 do mês seguinte por agente (só importa quando um turno do último dia do mês termina às 24:00). null = não deu para ler. */
+async function nextMonthFirstDay(team, month) {
+  const [y, mo] = month.split('-').map(Number);
+  const next = mo === 12 ? `${y + 1}-01` : `${y}-${dd(mo + 1)}`;
+  try {
+    const cells = (await baseCellsOf(team, next)).cells;
+    return Object.fromEntries(Object.entries(cells).map(([email, days]) => [email, days[1] ?? []]));
+  } catch { return null; }
+}
+
 // ---------- revisão / checkout ----------
 async function buildReview(team, month) {
   const agents = agentsOf(team);
@@ -139,7 +259,7 @@ async function buildReview(team, month) {
   const eff = effectiveCells(base.cells, d, emails);
   const stale = staleItems(d, base.cells);
   const health = runHealthCheck({ month, agents, cells: eff, timeoffs: await repo.timeoffs.list(month) });
-  const plan = planExports({ team, month, items, baseCells: base.cells, agents, activities: C.activities, today: today(), gapDays: CSV_GAP_DAYS });
+  const plan = planExports({ team, month, items, baseCells: base.cells, nextMonthFirst: await nextMonthFirstDay(team, month), agents, activities: C.activities, today: today(), gapDays: CSV_GAP_DAYS });
   const unexpressible = plan.unexpressible.map((u) => ({ agent: agents.find((a) => a.email === u.email), date: `${month}-${dd(u.day)}`, previousShifts: u.before }));
   return { draft: d, items, stale, health, plan, unexpressible };
 }
@@ -215,7 +335,9 @@ async function api(req, res, url) {
   if (req.method === 'GET' && path === '/api/health') return send(res, 200, { status: 'ok' }); // instantâneo: não consulta Sheets nem WFM
   if (req.method === 'GET' && path === '/api/dev/impersonate') return send(res, 200, { enabled: DEV_IMPERSONATE });
   if (req.method === 'GET' && path === '/api/mock/users') return send(res, 200, MOCK_AUTH ? (await repo.catalog()).logins : []);
-  await repo.tick(); // mock: simula o Apps Script (envio de folgas, consolidação de exportações)
+  // mock: simula o Apps Script (envio de folgas, consolidação de exportações). Sheets: lê os resultados do Apps Script; se o Google recusar por cota,
+  // a requisição segue com o que já se sabe (a próxima lê de novo) em vez de falhar.
+  try { await repo.tick(); } catch (e) { if (e.code !== 'sheets_unavailable') throw e; console.warn(`[sheets] tick adiado: ${e.message}`); }
   C = await repo.catalog();
   ACC = await repo.access.list();
   const need = (cap) => { if (repo.capabilities && !repo.capabilities[cap]) throw new HttpError(503, `Ainda não disponível com DATA_SOURCE=sheets (${cap}): a escrita chega por etapas na Fase 3.`); };
@@ -230,7 +352,11 @@ async function api(req, res, url) {
   }
 
   const user = identify(req);
-  if ((await accessMode()) === 'restricted' && !hasAccess(user, actx())) {
+  const pc = await portalCtx(user);
+  if (pc.agentOnly) {
+    // Agente (sem papel de supervisão) com o portal ligado: entra sempre (mesmo no modo restrito) e só vê o portal.
+    if (!(path === '/api/me' || path === '/api/meta' || path.startsWith('/api/portal/'))) throw new HttpError(403, 'Esta área é da supervisão. Use "Minha escala".', { code: 'agent_only' });
+  } else if ((await accessMode()) === 'restricted' && !hasAccess(user, actx())) {
     throw new HttpError(403, 'Você ainda não tem acesso a este app. Peça a liberação a quem administra a aba Acessos.', { code: 'no_access' });
   }
 
@@ -248,8 +374,127 @@ async function api(req, res, url) {
   }
 
   if (req.method === 'GET' && path === '/api/me') {
-    const teams = C.teams.map((t) => ({ name: t.name, coordinator: t.coordinator, role: roleFor(user, t, actx()), agentCount: agentsOf(t.name).length }));
-    return send(res, 200, { email: user, isAdmin: isAdmin(user, actx()), teams, defaultTeam: defaultTeam(user, C.teams, actx()) });
+    const teams = pc.agentOnly ? [] : C.teams.map((t) => ({ name: t.name, coordinator: t.coordinator, role: roleFor(user, t, actx()), agentCount: agentsOf(t.name).length }));
+    return send(res, 200, { email: user, isAdmin: isAdmin(user, actx()), teams, defaultTeam: pc.agentOnly ? null : defaultTeam(user, C.teams, actx()), agentOnly: pc.agentOnly, isAgent: !!pc.agent, portal: pc.on });
+  }
+
+  // ----- portal do agente (somente leitura): o time do próprio agente e as folgas dele -----
+  if (path.startsWith('/api/portal/')) {
+    if (!pc.agent) throw new HttpError(404, 'Você não aparece como agente de nenhum time.');
+    if (!pc.on && !isAdmin(user, actx())) throw new HttpError(403, 'O portal do agente ainda não foi liberado.', { code: 'portal_off' });
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(m)) throw new HttpError(422, 'Mês inválido.');
+    const team = pc.agent.team;
+    if (req.method === 'GET' && path === '/api/portal/schedule') {
+      const agents = agentsOf(team);
+      const all = await repo.cells(m); // PUBLICADO (extração do WFM): nunca o rascunho do supervisor
+      const cells = Object.fromEntries(agents.map((a) => [a.email, all[a.email] ?? {}]));
+      const vac = String((await repo.settings()).reason_vacation ?? '').trim();
+      const vacationReasonId = C.reasons.some((r) => r.taskId === vac) ? vac : '';
+      const view = buildPortalSchedule({ agents, self: user.toLowerCase(), month: m, cells, timeoffs: await teamTimeoffs(team, m), vacationReasonId, extra: extraDays({ month: m, cells, weekdays: await weekdaysOfTeam(team) }) });
+      return send(res, 200, { month: m, today: localDate(), daysInMonth: daysInMonth(m), teamLabel: `Time de ${displayName(team)}`, ...view });
+    }
+    // ----- trocas de dia extra (agente): pedir, o colega aceitar ou recusar, quem pediu cancelar -----
+    const nameOf = (email) => agentsOf(team).find((a) => a.email === email)?.name ?? email;
+    if (req.method === 'GET' && path === '/api/portal/swaps') {
+      await expireSwaps();
+      const me = pc.agent.email.toLowerCase(), floor = addDaysIso(localDate(), -60);
+      const mine = (await repo.swaps.list()).filter((s) => s.team === team && (s.requester === me || s.owner === me) && swapDates(s).some((d) => d >= floor));
+      return send(res, 200, mine.map((s) => ({
+        id: s.id, role: s.requester === me ? 'solicitante' : 'dono', otherName: nameOf(s.requester === me ? s.owner : s.requester), date: s.date, offerDate: s.offerDate || '',
+        status: s.status, statusLabel: SWAP_LABEL[s.status] ?? s.status, refusedBy: s.refusedBy || '', createdAt: s.createdAt, note: s.status === 'invalidada' ? s.note : '',
+      })));
+    }
+    if (req.method === 'POST' && path === '/api/portal/swaps') {
+      need('swaps');
+      await expireSwaps();
+      const b = await readBody(req), me = pc.agent.email.toLowerCase();
+      const owner = agentsOf(team).find((a) => String(a.id) === String(b.ownerId));
+      if (!owner) throw new HttpError(404, 'Colega não encontrado no seu time.');
+      if (!isDate(b.date) || (b.offerDate && !isDate(b.offerDate))) throw new HttpError(422, 'Data inválida.');
+      const now = new Date().toISOString();
+      const swap = { id: randomUUID().slice(0, 8), team, requester: me, owner: owner.email.toLowerCase(), date: b.date, offerDate: b.offerDate || '', status: 'pendente_agente', refusedBy: '', createdAt: now, updatedAt: now, decidedBy: '', note: '' };
+      const ctx = await swapContext(team, swapDates(swap));
+      if (ctx.openSwaps.filter((s) => s.requester === me && SWAP_OPEN.includes(s.status)).length >= 10) throw new HttpError(409, 'Você já tem 10 pedidos de troca em aberto.');
+      const errs = validateSwap(swap, ctx);
+      if (errs.length) throw new HttpError(422, errs[0], { violations: errs });
+      await repo.swaps.add(swap);
+      audit.log({ actor: user, team, month: swap.date.slice(0, 7), action: 'swap.request', agentEmail: swap.owner, details: `${swap.id}: ${me} pede o dia ${swap.date} de ${swap.owner}${swap.offerDate ? ` e oferece ${swap.offerDate}` : ''}` });
+      notifySwap({ event: 'pedido', swap });
+      return send(res, 201, { id: swap.id });
+    }
+    const smatch = path.match(/^\/api\/portal\/swaps\/([\w-]+)\/(respond|cancel)$/);
+    if (req.method === 'POST' && smatch) {
+      need('swaps');
+      const swap = await repo.swaps.get(smatch[1]), me = pc.agent.email.toLowerCase();
+      if (!swap || swap.team !== team || (swap.requester !== me && swap.owner !== me)) throw new HttpError(404, 'Troca não encontrada.');
+      const now = new Date().toISOString(), month = swap.date.slice(0, 7);
+      if (smatch[2] === 'cancel') {
+        if (swap.requester !== me) throw new HttpError(403, 'Só quem pediu pode cancelar.');
+        if (!SWAP_OPEN.includes(swap.status)) throw new HttpError(409, 'Essa troca já foi decidida ou encerrada.');
+        await repo.swaps.update(swap.id, { status: 'cancelada', updatedAt: now });
+        audit.log({ actor: user, team, month, action: 'swap.cancel', agentEmail: swap.owner, details: swap.id });
+        return send(res, 200, { ok: true });
+      }
+      if (swap.owner !== me) throw new HttpError(403, 'Só o colega dono do dia responde ao pedido.');
+      if (swap.status !== 'pendente_agente') throw new HttpError(409, 'Essa troca não está aguardando a sua resposta.');
+      const b = await readBody(req);
+      if (b.accept === true) {
+        const errs = validateSwap(swap, await swapContext(team, swapDates(swap)), swap.id);
+        if (errs.length) {
+          await repo.swaps.update(swap.id, { status: 'invalidada', note: errs[0], updatedAt: now });
+          audit.log({ actor: user, team, month, action: 'swap.invalidate', agentEmail: swap.requester, details: `${swap.id}: ${errs[0]}` });
+          throw new HttpError(409, `Essa troca não vale mais: ${errs[0]}`);
+        }
+        await repo.swaps.update(swap.id, { status: 'pendente_supervisor', updatedAt: now });
+        audit.log({ actor: user, team, month, action: 'swap.respond', agentEmail: swap.requester, details: `${swap.id}: aceita` });
+        notifySwap({ event: 'aceita', swap });
+      } else {
+        await repo.swaps.update(swap.id, { status: 'recusada', refusedBy: 'agente', updatedAt: now });
+        audit.log({ actor: user, team, month, action: 'swap.respond', agentEmail: swap.requester, details: `${swap.id}: recusada` });
+        notifySwap({ event: 'recusada_agente', swap });
+      }
+      return send(res, 200, { ok: true });
+    }
+    if (req.method === 'GET' && path === '/api/portal/timeoffs') {
+      return send(res, 200, ownTimeoffs(await repo.timeoffs.list(m), pc.agent.email.toLowerCase(), m));
+    }
+    if (req.method === 'POST' && path === '/api/portal/timeoffs') {
+      need('timeoffs');
+      const b = await readBody(req);
+      const reason = C.reasons.find((r) => r.taskId === b.reasonId);
+      if (!reason) throw new HttpError(422, 'Escolha o motivo da folga.');
+      if (!b.startTime || !b.endTime || b.startTime >= b.endTime) throw new HttpError(422, 'Período inválido (o fim deve ser depois do início).');
+      const s0 = toLocalIso(b.startTime), s1 = toLocalIso(b.endTime);
+      if (!(Date.parse(`${s1.slice(0, 10)}T12:00:00Z`) - Date.parse(`${s0.slice(0, 10)}T12:00:00Z`) <= 400 * 86400000)) throw new HttpError(422, 'Período longo demais.');
+      const email = pc.agent.email.toLowerCase();
+      const mine = (await repo.timeoffs.list(s0.slice(0, 7))).filter((t) => t.email.toLowerCase() === email);
+      const clash = mine.find((t) => ['agendada', 'pendente', 'aprovada'].includes(t.status) && toLocalIso(t.startTime) < s1 && toLocalIso(t.endTime) > s0);
+      if (clash) throw new HttpError(409, `Você já tem uma folga ou pedido nesse período (${clash.reasonName}).`);
+      if (mine.filter(cancelableByAgent).length >= 20) throw new HttpError(409, 'Você já tem 20 pedidos aguardando decisão. Espere a supervisão decidir ou cancele algum.');
+      const t = { id: randomUUID(), email: pc.agent.email, reasonId: reason.taskId, reasonName: reason.taskName, startTime: b.startTime, endTime: b.endTime, status: 'agendada', request: true, origin: 'agent', createdAt: new Date().toISOString(), scheduledAt: schedulePending(), createdBy: user };
+      await repo.timeoffs.add(t);
+      audit.log({ actor: user, team, month: s0.slice(0, 7), action: 'timeoff.request', agentEmail: t.email, after: t, details: reason.taskName });
+      return send(res, 201, { id: t.id, scheduledAt: t.scheduledAt });
+    }
+    const pc2 = path.match(/^\/api\/portal\/timeoffs\/([\w-]+)\/cancel$/);
+    if (req.method === 'POST' && pc2) {
+      need('timeoffs');
+      const t = await repo.timeoffs.get(pc2[1]);
+      if (!t || t.email.toLowerCase() !== pc.agent.email.toLowerCase()) throw new HttpError(404, 'Pedido não encontrado.');
+      if (t.request && t.status === 'agendada') { // ainda na carência: nada foi ao WFM
+        await repo.timeoffs.remove(t.id);
+        audit.log({ actor: user, team, month: isoDate(t.startTime).slice(0, 7), action: 'timeoff.request.cancel', agentEmail: t.email, before: t, details: `${t.reasonName} (antes do envio)` });
+        return send(res, 200, { ok: true });
+      }
+      if (t.status === 'pendente') { // já no WFM e ainda sem decisão: nega por id
+        const upd = await repo.timeoffs.update(t.id, { status: 'negada', decidedBy: user, deniedAt: new Date().toISOString() });
+        if (!upd) throw new HttpError(409, 'Este pedido acabou de ser enviado ao WFM e ainda não voltou na extração. Tente de novo em alguns minutos.');
+        audit.log({ actor: user, team, month: isoDate(t.startTime).slice(0, 7), action: 'timeoff.request.cancel', agentEmail: t.email, before: t, details: `${t.reasonName} (cancelado pelo agente)` });
+        return send(res, 200, { ok: true });
+      }
+      throw new HttpError(409, 'Só dá para cancelar um pedido que ainda aguarda decisão.');
+    }
+    throw new HttpError(404, 'Rota não encontrada.');
   }
 
   if (req.method === 'GET' && path === '/api/schedule') {
@@ -260,6 +505,7 @@ async function api(req, res, url) {
     return send(res, 200, {
       month: m, team: team.name, role: roleFor(user, team, actx()), daysInMonth: daysInMonth(m), agents,
       cells: effectiveCells(base.cells, d, agents.map((a) => a.email)), draft: draftView(d), pending: base.pending,
+      extra: extraDays({ month: m, cells: effectiveCells(base.cells, d, agents.map((a) => a.email)), weekdays: await weekdaysOfTeam(team.name) }),
     });
   }
 
@@ -277,6 +523,30 @@ async function api(req, res, url) {
     presence.markEdit(user, b.team, b.month);
     audit.log({ actor: user, team: b.team, month: b.month, action: 'draft.save', agentEmail: b.email, day: b.day, before: published, after: b.shifts ?? [] });
     return send(res, 200, { ok: true, draft: draftView(d) });
+  }
+  // a mesma escala em vários dias de um agente (clicar no nome do agente na grade): entra no rascunho de uma vez
+  if (req.method === 'PUT' && path === '/api/draft/days') {
+    need('drafts');
+    const b = await readBody(req);
+    requireEditor(user, b.team);
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(b.month ?? ''))) throw new HttpError(422, 'Mês inválido.');
+    if (!agentsOf(b.team).some((a) => a.email === b.email)) throw new HttpError(404, 'Agente não pertence ao time.');
+    const days = Array.isArray(b.days) ? b.days : [];
+    if (!days.length) throw new HttpError(422, 'Selecione ao menos um dia.');
+    const nDays = daysInMonth(b.month), seen = new Set();
+    for (const x of days) {
+      if (!Number.isInteger(x.day) || x.day < 1 || x.day > nDays) throw new HttpError(422, `Dia inválido: ${x.day}.`);
+      if (seen.has(x.day)) throw new HttpError(422, `Dia repetido: ${x.day}.`);
+      seen.add(x.day);
+      for (const s of x.shifts ?? []) if (s.startTime >= s.endTime) throw new HttpError(422, `Dia ${x.day}: atividade com duração zero.`);
+    }
+    const base = (await baseCellsOf(b.team, b.month)).cells[b.email] ?? {};
+    locks.assertFree(dkey(b.team, b.month));
+    const entries = days.map((x) => ({ day: x.day, after: x.shifts ?? [], published: base[x.day] ?? [] }));
+    const d = store.saveDays({ team: b.team, month: b.month, email: b.email, entries, user, version: b.version });
+    presence.markEdit(user, b.team, b.month);
+    for (const e of entries) audit.log({ actor: user, team: b.team, month: b.month, action: 'draft.save', agentEmail: b.email, day: e.day, before: e.published, after: e.after, details: `em lote (${entries.length} dia(s))` });
+    return send(res, 200, { ok: true, days: entries.length, draft: draftView(d) });
   }
   if (req.method === 'DELETE' && path === '/api/draft/item') {
     need('drafts');
@@ -303,7 +573,7 @@ async function api(req, res, url) {
       version: rv.draft?.version ?? 0, items: rv.items.map((i) => ({ ...i, agentName: C.agents.find((a) => a.email === i.email)?.name })),
       stale: rv.stale.map((s) => ({ email: s.email, day: s.day })), health: rv.health,
       files: rv.plan.files.map((f) => ({ name: f.name, window: f.window, agents: f.agents.length, rows: f.rows, days: f.days, reemitted: f.reemitted })),
-      errors: rv.plan.errors, warnings: rv.plan.warnings,
+      errors: rv.plan.errors, warnings: rv.plan.warnings, configWarnings: configWarnings(rv.items),
       unexpressible: rv.unexpressible.map((r) => ({ email: r.agent.email, date: r.date })),
     });
   }
@@ -322,17 +592,12 @@ async function api(req, res, url) {
     const team = teamOf(q.get('team') ?? defaultTeam(user, C.teams, actx()));
     const ov = await repo.genConfig.get(team.name);
     const scales = C.standardScales.map((sc) => ({ id: sc.id, ...rowToDefinition(sc) }));
-    const byId = new Map(scales.map((x) => [x.id, x]));
     return send(res, 200, {
       team: team.name, month: m, role: roleFor(user, team, actx()),
       taskId: ov?.taskId ?? team.defaultTaskId, defaultTaskId: team.defaultTaskId,
       tasks: C.activities.filter((a) => a.taskType !== 'generalTask'),
       scales,
-      agents: agentsOf(team.name).map((a) => {
-        const o = ov?.agents?.[a.email];
-        if (!o) return { email: a.email, name: a.name, scaleId: a.scaleId, def: a.def };
-        return { email: a.email, name: a.name, scaleId: o.scaleId, def: o.scaleId ? byId.get(o.scaleId) : o.custom };
-      }),
+      agents: agentsOf(team.name).map((a) => ({ email: a.email, name: a.name, scaleId: a.scaleId, def: a.def })), // sempre o cadastro (Users)
     });
   }
   if (req.method === 'POST' && path === '/api/draft/generate') {
@@ -365,8 +630,7 @@ async function api(req, res, url) {
     const d = store.replaceAgents({ team: b.team, month: b.month, emails: resolved.map((r) => r.email), entries, user, version: b.version });
     presence.markEdit(user, b.team, b.month);
     // guarda as configurações (mock da aba GeradorConfig): a próxima abertura do gerador já vem com elas
-    const prevCfg = await repo.genConfig.get(b.team); // aplicar só a alguns agentes não pode apagar a configuração dos demais
-    await repo.genConfig.set(b.team, { taskId: b.taskId, agents: { ...(prevCfg?.agents ?? {}), ...Object.fromEntries(resolved.map((r) => [r.email, { scaleId: r.scaleId, custom: r.scaleId ? null : r.def }])) }, updatedBy: user });
+    await repo.genConfig.set(b.team, { taskId: b.taskId, updatedBy: user }); // só o workstream padrão; a escala de cada agente vem sempre de Users
     audit.log({ actor: user, team: b.team, month: b.month, action: 'draft.generate', details: `${resolved.length} agente(s) · ${task.taskName} · ${d?.items.size ?? 0} alteração(ões) no rascunho` });
     return send(res, 200, { ok: true, draft: draftView(d), agents: resolved.length, items: d?.items.size ?? 0 });
   }
@@ -387,6 +651,117 @@ async function api(req, res, url) {
     audit.log({ actor: user, team: C.agents.find((a) => a.email === b.email).team, month: isoDate(b.startTime).slice(0, 7), action: 'timeoff.create', agentEmail: b.email, after: t, details: reason.taskName });
     return send(res, 201, t);
   }
+  // ----- trocas de dia extra (supervisão): ver, consolidar no rascunho ou recusar -----
+  if (req.method === 'GET' && path === '/api/swaps') {
+    const team = teamOf(q.get('team') ?? defaultTeam(user, C.teams, actx())).name;
+    await expireSwaps();
+    const list = (await repo.swaps.list()).filter((s) => s.team === team && swapDates(s).some((d) => d.startsWith(m)));
+    const nameOf = (email) => agentsOf(team).find((a) => a.email === email)?.name ?? email;
+    const ctx = list.length ? await swapContext(team, list.flatMap(swapDates)) : null;
+    return send(res, 200, list.map((s) => {
+      const waiting = s.status === 'pendente_supervisor';
+      return {
+        id: s.id, status: s.status, statusLabel: SWAP_LABEL[s.status] ?? s.status, requesterName: nameOf(s.requester), ownerName: nameOf(s.owner), date: s.date, offerDate: s.offerDate || '',
+        createdAt: s.createdAt, decidedBy: s.decidedBy, refusedBy: s.refusedBy, note: s.note,
+        warnings: waiting ? swapWarnings({ ops: swapOps(s, ctx.shiftsOn), shiftsOn: ctx.shiftsOn, lunchTaskId: C.ctx.lunch.taskId, nameOf }) : [],
+        problems: waiting ? validateSwap(s, ctx, s.id) : [],
+      };
+    }).sort((a, b) => (a.status === 'pendente_supervisor' ? 0 : 1) - (b.status === 'pendente_supervisor' ? 0 : 1) || a.date.localeCompare(b.date)));
+  }
+  const dmatch = path.match(/^\/api\/swaps\/([\w-]+)\/decision$/);
+  if (req.method === 'POST' && dmatch) {
+    need('swaps'); need('drafts');
+    const swap = await repo.swaps.get(dmatch[1]);
+    if (!swap) throw new HttpError(404, 'Troca não encontrada.');
+    requireEditor(user, swap.team);
+    if (swap.status !== 'pendente_supervisor') throw new HttpError(409, 'Essa troca não está aguardando a supervisão.');
+    const b = await readBody(req), now = new Date().toISOString(), team = swap.team;
+    if (b.action === 'deny') {
+      await repo.swaps.update(swap.id, { status: 'recusada', refusedBy: 'supervisor', decidedBy: user, note: String(b.note ?? '').slice(0, 300), updatedAt: now });
+      audit.log({ actor: user, team, month: swap.date.slice(0, 7), action: 'swap.deny', agentEmail: swap.requester, details: swap.id });
+      notifySwap({ event: 'recusada_supervisao', swap });
+      return send(res, 200, { ok: true });
+    }
+    if (b.action !== 'consolidate') throw new HttpError(422, 'Ação inválida.');
+    const ctx = await swapContext(team, swapDates(swap));
+    const errs = validateSwap(swap, ctx, swap.id);
+    if (errs.length) {
+      await repo.swaps.update(swap.id, { status: 'invalidada', note: errs[0], updatedAt: now });
+      audit.log({ actor: user, team, month: swap.date.slice(0, 7), action: 'swap.invalidate', agentEmail: swap.requester, details: `${swap.id}: ${errs[0]}` });
+      throw new HttpError(409, `Essa troca não vale mais: ${errs[0]}`);
+    }
+    const ops = swapOps(swap, ctx.shiftsOn), nameOf = (email) => agentsOf(team).find((a) => a.email === email)?.name ?? email;
+    for (const op of ops) { // o rascunho não pode ter mexido nesses dias nem estar sendo confirmado
+      const month = op.date.slice(0, 7), day = Number(op.date.slice(8, 10));
+      locks.assertFree(dkey(team, month));
+      if (store.get(team, month)?.items.has(`${op.email}|${day}`)) throw new HttpError(409, `O rascunho de ${month} já tem alteração de ${nameOf(op.email)} no dia ${day}. Confirme ou descarte antes de consolidar a troca.`);
+    }
+    for (const op of ops) { // sem await entre as gravações: entram todas ou nenhuma
+      const month = op.date.slice(0, 7), day = Number(op.date.slice(8, 10)), published = ctx.shiftsOn(op.email, op.date);
+      store.saveDay({ team, month, email: op.email, day, after: op.after, published, user, version: store.get(team, month)?.version ?? 0 });
+      presence.markEdit(user, team, month);
+      audit.log({ actor: user, team, month, action: 'draft.save', agentEmail: op.email, day, before: published, after: op.after, details: `troca ${swap.id}` });
+    }
+    await repo.swaps.update(swap.id, { status: 'consolidada', decidedBy: user, updatedAt: now });
+    audit.log({ actor: user, team, month: swap.date.slice(0, 7), action: 'swap.consolidate', agentEmail: swap.requester, details: `${swap.id}: ${ops.length} dia(s) de agente no rascunho` });
+    notifySwap({ event: 'consolidada', swap });
+    return send(res, 200, { ok: true, months: [...new Set(ops.map((o) => o.date.slice(0, 7)))] });
+  }
+
+  // ----- folgas em lote (uma folga por agente, ligadas por loteId) -----
+  if (req.method === 'GET' && path === '/api/holidays') {
+    const team = teamOf(q.get('team') ?? defaultTeam(user, C.teams, actx())).name;
+    const wanted = String((await repo.settings()).holiday_reason_id ?? '').trim();
+    const reason = C.reasons.find((r) => r.taskId === wanted) ?? C.reasons.find((r) => /holiday|feriado/i.test(r.taskName));
+    return send(res, 200, { holidays: holidaysFor(await repo.holidays.list(), team, m), reasonId: reason?.taskId ?? '' });
+  }
+  if (req.method === 'POST' && path === '/api/timeoff-lots/preview') {
+    const b = await readBody(req);
+    const team = teamOf(b.team);
+    if (!b.startTime || !b.endTime || b.startTime >= b.endTime) throw new HttpError(422, 'Período inválido (fim deve ser depois do início).');
+    return send(res, 200, { agents: await lotPreview(team.name, b.startTime, b.endTime) });
+  }
+  if (req.method === 'GET' && path === '/api/timeoff-lots') {
+    need('timeoffs');
+    const team = teamOf(q.get('team') ?? defaultTeam(user, C.teams, actx())).name;
+    const mine = new Set(agentsOf(team).map((a) => a.email));
+    const first = `${m}-01`, last = `${m}-${dd(daysInMonth(m))}`;
+    const lots = (await repo.timeoffs.lots()).filter((l) => l.items.some((i) => mine.has(i.email)) && l.items.some((i) => isoDate(toLocalIso(i.startTime)) <= last && isoDate(toLocalIso(i.endTime)) >= first));
+    return send(res, 200, lots.map(lotView).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 20));
+  }
+  if (req.method === 'POST' && path === '/api/timeoff-lots') {
+    need('timeoffs');
+    const b = await readBody(req);
+    const team = teamOf(b.team);
+    requireEditor(user, team.name);
+    const reason = C.reasons.find((r) => r.taskId === b.reasonId);
+    if (!reason) throw new HttpError(422, 'Razão inexistente.');
+    if (!b.startTime || !b.endTime || b.startTime >= b.endTime) throw new HttpError(422, 'Período inválido (fim deve ser depois do início).');
+    const emails = [...new Set((Array.isArray(b.emails) ? b.emails : []).map((e) => String(e).trim().toLowerCase()).filter(Boolean))];
+    if (!emails.length) throw new HttpError(422, 'Selecione ao menos um agente.');
+    if (emails.length > LOT_MAX) throw new HttpError(422, `Um lote aceita até ${LOT_MAX} agentes.`);
+    const mine = new Set(agentsOf(team.name).map((a) => a.email));
+    const outsiders = emails.filter((e) => !mine.has(e));
+    if (outsiders.length) throw new HttpError(422, `Agentes que não são do time: ${outsiders.slice(0, 5).join(', ')}${outsiders.length > 5 ? '…' : ''}`);
+    const loteId = randomUUID().slice(0, 8), createdAt = new Date().toISOString(), scheduledAt = schedulePending();
+    const items = emails.map((email) => ({ id: randomUUID(), email, reasonId: reason.taskId, reasonName: reason.taskName, startTime: b.startTime, endTime: b.endTime, status: 'agendada', origin: 'app', createdAt, scheduledAt, createdBy: user, loteId }));
+    await repo.timeoffs.addMany(items);
+    for (const t of items) audit.log({ actor: user, team: team.name, month: isoDate(b.startTime).slice(0, 7), action: 'timeoff.create', agentEmail: t.email, after: t, details: `${reason.taskName} (lote ${loteId})` });
+    return send(res, 201, { loteId, count: items.length, scheduledAt });
+  }
+  const lm = path.match(/^\/api\/timeoff-lots\/([\w-]+)$/);
+  if (req.method === 'DELETE' && lm) {
+    need('timeoffs');
+    const lot = (await repo.timeoffs.lots()).find((l) => l.loteId === lm[1]);
+    if (!lot) throw new HttpError(404, 'Lote não encontrado.');
+    const team = C.agents.find((a) => a.email === lot.items[0].email)?.team;
+    requireEditor(user, team);
+    const open = lot.items.filter((i) => i.status === 'agendada');
+    const cancelled = open.length ? await repo.timeoffs.removeMany(open.map((i) => i.id)) : 0;
+    for (const i of open) audit.log({ actor: user, team, month: isoDate(i.startTime).slice(0, 7), action: 'timeoff.delete', agentEmail: i.email, before: i, details: `${i.reasonName} (cancelado com o lote ${lot.loteId})` });
+    return send(res, 200, { cancelled, kept: lot.items.filter((i) => i.status === 'enviada' || i.status === 'erro').length });
+  }
+
   const tm = path.match(/^\/api\/timeoffs\/([\w-]+)$/);
   if (tm) {
     need('timeoffs');
@@ -423,10 +798,14 @@ async function api(req, res, url) {
     const before = { ...t };
     if (action === 'approve') {
       if (t.status !== 'pendente') throw new HttpError(409, 'Só pedidos pendentes podem ser aceitos.');
-      Object.assign(t, await repo.timeoffs.update(t.id, { status: 'aprovada', decidedBy: user, approvedAt: new Date().toISOString() }));
+      const upd = await repo.timeoffs.update(t.id, { status: 'aprovada', decidedBy: user, approvedAt: new Date().toISOString() });
+      if (!upd) throw new HttpError(409, 'Este pedido acabou de ser enviado ao WFM e ainda não voltou na extração. Tente de novo em alguns minutos.');
+      Object.assign(t, upd);
     } else if (action === 'deny') {
       if (!['pendente', 'aprovada'].includes(t.status)) throw new HttpError(409, 'Só é possível recusar um pedido pendente ou cancelar uma folga aprovada.');
-      Object.assign(t, await repo.timeoffs.update(t.id, { status: 'negada', decidedBy: user, deniedAt: new Date().toISOString() }));
+      const upd = await repo.timeoffs.update(t.id, { status: 'negada', decidedBy: user, deniedAt: new Date().toISOString() });
+      if (!upd) throw new HttpError(409, 'Este pedido acabou de ser enviado ao WFM e ainda não voltou na extração. Tente de novo em alguns minutos.');
+      Object.assign(t, upd);
     } else throw new HttpError(422, 'Ação inválida.');
     audit.log({ actor: user, team, month: isoDate(t.startTime).slice(0, 7), action: action === 'approve' ? 'timeoff.approve' : 'timeoff.deny', agentEmail: t.email, before, after: t, details: `${t.reasonName} (${before.status} → ${t.status})` });
     return send(res, 200, t);
@@ -467,6 +846,15 @@ async function api(req, res, url) {
   // ----- admin -----
   if (path.startsWith('/api/admin/')) {
     requireAdmin(user);
+    if (req.method === 'GET' && path === '/api/admin/sheets') return send(res, 200, repo.sheetsInfo?.() ?? null);
+    if (req.method === 'GET' && path === '/api/admin/portal') {
+      const st = await portalState(), vac = String((await repo.settings()).reason_vacation ?? '').trim();
+      const staffOf = (e) => hasAccess(e, actx()) || isAdmin(e, actx()) || C.teams.some((t) => roleFor(e, t, actx()) === 'editor');
+      return send(res, 200, {
+        on: st.on, source: st.source, invalid: !!st.invalid, agents: C.agents.length, staffAgents: C.agents.filter((a) => staffOf(a.email)).length,
+        vacation: { configured: !!vac, valid: !vac || C.reasons.some((r) => r.taskId === vac), reasonName: C.reasons.find((r) => r.taskId === vac)?.taskName ?? null },
+      });
+    }
     if (req.method === 'GET' && path === '/api/admin/presence') return send(res, 200, { intervalSec: PRESENCE_PING_SEC, sessions: presence.users({ all: true }) });
     if (req.method === 'GET' && path === '/api/admin/access') return send(res, 200, ACC.map((a) => ({ ...a, expired: !!a.validUntil && a.validUntil < today() })));
     if (req.method === 'POST' && path === '/api/admin/access') {
@@ -530,6 +918,10 @@ const PAGES = [
   { re: /^\/escalas\/[^/]+\/\d{4}-(0[1-9]|1[0-2])\/?$/, file: 'index.html' }, // /escalas/:time/:YYYY-MM (deep link)
   { re: /^\/folgas\/?$/, file: 'folgas.html' },
   { re: /^\/folgas\/[^/]+\/\d{4}-(0[1-9]|1[0-2])\/?$/, file: 'folgas.html' }, // /folgas/:time/:YYYY-MM
+  { re: /^\/trocas\/?$/, file: 'trocas.html' },
+  { re: /^\/trocas\/[^/]+\/\d{4}-(0[1-9]|1[0-2])\/?$/, file: 'trocas.html' }, // /trocas/:time/:YYYY-MM
+  { re: /^\/minha-escala\/?$/, file: 'agente.html' },
+  { re: /^\/minha-escala\/\d{4}-(0[1-9]|1[0-2])\/?$/, file: 'agente.html' }, // /minha-escala/:YYYY-MM
   { re: /^\/exportacoes\/?$/, file: 'exportacoes.html' },
   { re: /^\/exportacoes\/[^/]+\/?$/, file: 'exportacoes.html' }, // /exportacoes/:time
   { re: /^\/admin\/?$/, redirect: '/admin/estatisticas' },
@@ -594,7 +986,8 @@ http.createServer(async (req, res) => {
     else await route(res, decodeURIComponent(url.pathname));
   } catch (e) {
     if (!e.status) console.error(e);
-    send(res, e.status ?? 500, { error: String(e.message ?? e), violations: e.violations, code: e.code });
+    const msg = e.code === 'sheets_unavailable' ? 'O Google Sheets está limitando as consultas agora (cota). Aguarde alguns segundos e tente de novo.' : String(e.message ?? e);
+    send(res, e.status ?? 500, { error: msg, violations: e.violations, code: e.code });
   }
 }).listen(PORT, () => console.log(`WFM Escalas (${repo.kind}) em http://localhost:${PORT} · modo de entrada: aba Config (access_mode) ou ACCESS_MODE=${ENV_ACCESS_MODE}`));
 

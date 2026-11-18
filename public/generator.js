@@ -2,7 +2,7 @@
 import { icon, withIcon } from '/icons.js';
 import { $, esc, api, getJson, toast } from '/common.js';
 import {
-  applyEdit, definitionSummary, hhmmToMin, isLong, minToHHMM, parseWeekdays, planMonth, validateDefinition,
+  applyEdit, checkDefinition, definitionSummary, exitFromInput, exitToInput, hhmmToMin, isLong, minToHHMM, parseWeekdays, planMonth, validateDefinition,
   weekdaysLabel, weekdaysToString, WD_NAMES, WD_SHORT, LUNCH_MIN, localMonth,
 } from '/shared/rules.js';
 
@@ -93,12 +93,12 @@ export async function openGenerator({ team, month, cells, ctx, getVersion, onApp
   }
 
   function agentHtml(a, custom) {
-    const d = defOf(a), errs = validateDefinition(d);
+    const d = defOf(a), { erros: errs, avisos: warns } = checkDefinition(d);
     return `<div class="gen-agent${errs.length ? ' bad' : ''}">
       <input type="checkbox" data-asel="${esc(a.email)}" ${G.sel.has(a.email) ? 'checked' : ''} aria-label="Selecionar ${esc(a.name)}">
       <div class="who"><b>${esc(a.name)}</b><small>${esc(a.email)}</small></div>
       ${chips(d.weekdays)}
-      <div class="times">${errs.length ? `<span class="err-text">${esc(errs[0])}</span>` : esc(timesText(d))}${daysWith(a.email) ? ` <span class="gen-has" title="Já tem turnos neste mês (inclui o rascunho): aplicar substitui o mês inteiro">${daysWith(a.email)} dia(s) com escala</span>` : ''}</div>
+      <div class="times">${errs.length ? `<span class="err-text">${esc(errs[0])}</span>` : esc(timesText(d))}${!errs.length && warns.length ? ` <span class="warn-text" title="${esc(warns.join(' · '))}">${warns.length} aviso(s)</span>` : ''}${daysWith(a.email) ? ` <span class="gen-has" title="Já tem turnos neste mês (inclui o rascunho): aplicar substitui o mês inteiro">${daysWith(a.email)} dia(s) com escala</span>` : ''}</div>
       <div class="acts">${custom ? `<button class="icon-btn" data-edit="${esc(a.email)}">${withIcon('pencil', 'Editar', 16)}</button>` : ''}<button class="icon-btn" data-move="${esc(a.email)}">Mover</button></div></div>`;
   }
 
@@ -179,23 +179,23 @@ export async function openGenerator({ team, month, cells, ctx, getVersion, onApp
     const w = new Set(parseWeekdays(a.def.weekdays));
     let c = { entry: a.def.entry, lunch: a.def.lunch, snack: a.def.snack, snackDur: a.def.snackDur, exit: a.def.exit };
     const cur = () => ({ weekdays: weekdaysToString(w), ...c });
-    const t = (f, v, dis) => `<input type="time" step="60" data-f="${f}" value="${minToHHMM(v)}" ${dis ? 'disabled' : ''}>`;
+    const t = (f, v, dis) => `<input type="time" step="60" data-f="${f}" value="${minToHHMM(f === 'exit' ? exitToInput(v) : v)}" ${dis ? 'disabled' : ''}>`;
     const draw = () => {
       const long = isLong(c.entry ?? 0, c.exit ?? 0);
-      const errs = validateDefinition(cur());
+      const { erros: errs, avisos: warns } = checkDefinition(cur());
       sub.innerHTML = `<div class="modal-card small"><h2>Editar escala · ${esc(a.name)}</h2>
         <div class="row"><label>Dias da semana</label><div class="wd-edit">${WD_NAMES.map((n, i) => `<label class="gen-check"><input type="checkbox" data-wd="${i + 1}" ${w.has(i + 1) ? 'checked' : ''}> ${n}</label>`).join('')}</div></div>
         <div class="row"><label>Entrada</label>${t('entry', c.entry)}</div>
         <div class="row"><label>Almoço (início)</label>${t('lunch', long ? c.lunch : null, !long)}</div>
         <div class="row"><label>Snack (início)</label>${t('snack', c.snack)}</div>
         <div class="row"><label>Snack (duração)</label><div><input type="number" min="1" step="1" data-f="snackDur" value="${c.snackDur ?? ''}" style="width:90px"> min</div></div>
-        <div class="row"><label>Saída</label>${t('exit', c.exit)}</div>
-        ${errs.length ? `<ul class="errors">${errs.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}
+        <div class="row"><label>Saída</label><div>${t('exit', c.exit)}${c.exit >= 1440 ? ' <small>24:00 (meia-noite do dia seguinte)</small>' : ''}</div></div>
+        ${errs.length ? `<ul class="errors">${errs.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}${warns.length ? `<ul class="warns">${warns.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}
         <div class="actions" style="justify-content:flex-end"><button id="edCancel">Cancelar</button><button id="edOk" class="primary" ${errs.length ? 'disabled' : ''}>${withIcon('check', 'Salvar', 16)}</button></div></div>`;
       sub.classList.remove('hidden');
       sub.querySelectorAll('[data-wd]').forEach((x) => (x.onchange = () => { x.checked ? w.add(+x.dataset.wd) : w.delete(+x.dataset.wd); draw(); }));
       sub.querySelectorAll('[data-f]').forEach((x) => (x.onchange = () => {
-        const f = x.dataset.f, v = f === 'snackDur' ? Number(x.value) : hhmmToMin(x.value);
+        const f = x.dataset.f, v = f === 'snackDur' ? Number(x.value) : f === 'exit' ? exitFromInput(hhmmToMin(x.value)) : hhmmToMin(x.value);
         if (v == null || Number.isNaN(v)) return draw();
         c = applyEdit({ taskId: 'x', ...c }, f, v); // mesmas regras do dia: 9h, proporcionalidade, snack 15/45
         c = { entry: c.entry, lunch: c.lunch, snack: c.snack, snackDur: c.snackDur, exit: c.exit };

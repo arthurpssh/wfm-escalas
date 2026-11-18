@@ -31,9 +31,19 @@ export const hhmmToMin = (s) => {
   return h * 60 + m;
 };
 export const roundMin = (m) => Math.round(m / STEP) * STEP;
-export const toIso = (date, min) => `${date}T${minToHHMM(min)}:00${TZ}`;
+export const DAY_MIN = 1440;
+export const addDaysIso = (date, n) => new Date(Date.parse(`${date}T12:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
+/** Minutos desde 00:00 de `date`. A partir de 1440 o instante cai no(s) dia(s) seguinte(s): 1440 = 00:00 do dia seguinte (a "saída às 24:00"). */
+export const toIso = (date, min) => (min >= DAY_MIN
+  ? `${addDaysIso(date, Math.floor(min / DAY_MIN))}T${minToHHMM(min % DAY_MIN)}:00${TZ}`
+  : `${date}T${minToHHMM(min)}:00${TZ}`);
 export const isoDate = (iso) => iso.slice(0, 10);
 export const isoMin = (iso) => hhmmToMin(iso.slice(11, 16));
+/** Minutos do instante `iso` contados desde 00:00 de `date` (passa de 1440 se for depois da meia-noite seguinte). */
+export const isoMinOn = (iso, date) => Math.round((Date.parse(`${isoDate(iso)}T12:00:00Z`) - Date.parse(`${date}T12:00:00Z`)) / 86400000) * DAY_MIN + isoMin(iso);
+/** O campo de hora vai de 00:00 a 23:59: na SAÍDA, "00:00" quer dizer 24:00 (meia-noite do dia seguinte). */
+export const exitFromInput = (min) => (min === 0 ? DAY_MIN : min);
+export const exitToInput = (min) => (min != null && min >= DAY_MIN ? min - DAY_MIN : min);
 export const dateOf = (month, day) => `${month}-${pad(day)}`;
 
 export const isLong = (entry, exit) => exit - entry >= LONG_DAY_MIN;
@@ -51,16 +61,15 @@ export function defaultConfig(taskId) {
 export function configToShifts(cfg, date, ctx) {
   const main = ctx.tasks.get(cfg.taskId);
   const seg = (t, s, e) => ({ taskType: t.taskType ?? 'generalTask', taskId: t.taskId, taskName: t.taskName, startTime: toIso(date, s), endTime: toIso(date, e) });
+  // pausas em ordem de horário: o snack pode vir antes do almoço
+  const breaks = [];
+  if (cfg.lunch != null) breaks.push([ctx.lunch, cfg.lunch, cfg.lunch + LUNCH_MIN]);
+  breaks.push([ctx.snack, cfg.snack, cfg.snack + cfg.snackDur]);
+  breaks.sort((a, b) => a[1] - b[1]);
   const out = [];
   let cursor = cfg.entry;
-  if (cfg.lunch != null) {
-    out.push(seg(main, cursor, cfg.lunch));
-    out.push(seg(ctx.lunch, cfg.lunch, cfg.lunch + LUNCH_MIN));
-    cursor = cfg.lunch + LUNCH_MIN;
-  }
-  out.push(seg(main, cursor, cfg.snack));
-  out.push(seg(ctx.snack, cfg.snack, cfg.snack + cfg.snackDur));
-  out.push(seg(main, cfg.snack + cfg.snackDur, cfg.exit));
+  for (const [t, s, e] of breaks) { out.push(seg(main, cursor, s), seg(t, s, e)); cursor = e; }
+  out.push(seg(main, cursor, cfg.exit));
   return out.filter((s) => s.startTime < s.endTime);
 }
 
@@ -74,8 +83,10 @@ export function shiftsToConfig(shifts, ctx) {
   const mainId = work[0]?.taskId ?? null;
   let irregular = lunches.length > 1 || snacks.length !== 1 || !mainId || work.some((w) => w.taskId !== mainId);
   for (let i = 1; i < sorted.length; i++) if (sorted[i].startTime !== sorted[i - 1].endTime) irregular = true;
+  const date0 = isoDate(sorted[0].startTime);
   const entry = isoMin(sorted[0].startTime);
-  const exit = isoMin(sorted.at(-1).endTime);
+  const exit = isoMinOn(sorted.at(-1).endTime, date0);
+  if (exit > DAY_MIN) irregular = true; // vira o dia de verdade (ex.: 22:00 a 02:00): ainda não editável pelo padrão
   const snack = snacks[0] ? isoMin(snacks[0].startTime) : null;
   return {
     irregular,
@@ -85,7 +96,7 @@ export function shiftsToConfig(shifts, ctx) {
       exit,
       lunch: lunches[0] ? isoMin(lunches[0].startTime) : null,
       snack,
-      snackDur: snacks[0] ? isoMin(snacks[0].endTime) - snack : defaultSnackDur(entry, exit),
+      snackDur: snacks[0] ? isoMinOn(snacks[0].endTime, date0) - snack : defaultSnackDur(entry, exit),
     },
   };
 }
@@ -115,22 +126,41 @@ export function applyEdit(cfg, field, value) {
   return c;
 }
 
-export function validateConfig(c) {
-  const e = [];
-  if (!c.taskId) e.push('Selecione o workstream/multitask.');
-  if (c.entry == null || c.exit == null) return [...e, 'Informe entrada e saída.'];
-  if (c.exit <= c.entry) return [...e, 'A saída deve ser depois da entrada.'];
-  if (c.snack == null) return [...e, 'Informe o início do snack.'];
-  if (!(c.snackDur > 0)) e.push('A duração do snack deve ser maior que zero.');
-  const long = isLong(c.entry, c.exit);
-  if (long && c.lunch == null) e.push('Informe o início do almoço.');
-  if (c.lunch != null) {
-    if (c.lunch <= c.entry) e.push('O almoço deve começar depois da entrada.');
-    if (c.snack < c.lunch + LUNCH_MIN) e.push(`O snack deve começar após o fim do almoço (${minToHHMM(c.lunch + LUNCH_MIN)}).`);
-  } else if (c.snack <= c.entry) e.push('O snack deve começar depois da entrada.');
-  if (c.snack + c.snackDur >= c.exit) e.push('O snack deve terminar antes da saída.');
-  return e;
+export const LONG_SHIFT_WARN_MIN = 10 * 60;
+
+/**
+ * Valida a configuração do dia. `erros` bloqueiam (gerariam um CSV impossível ou rejeitado pelo WFM: pausa fora do turno ou
+ * sobreposta, duração zero, saída antes da entrada); `avisos` só alertam e o supervisor decide (snack antes do almoço,
+ * jornada longa sem almoço, pausa colada na entrada ou na saída, jornada acima de 10 h).
+ */
+export function checkConfig(c) {
+  const erros = [], avisos = [];
+  if (!c.taskId) erros.push('Selecione o workstream/multitask.');
+  if (c.entry == null || c.exit == null) return { erros: [...erros, 'Informe entrada e saída.'], avisos };
+  if (c.exit <= c.entry) return { erros: [...erros, 'A saída deve ser depois da entrada.'], avisos };
+  if (c.exit > DAY_MIN) erros.push('A saída pode ir no máximo até 24:00 (meia-noite do dia seguinte).');
+  if (c.snack == null) return { erros: [...erros, 'Informe o início do snack.'], avisos };
+  if (!(c.snackDur > 0)) erros.push('A duração do snack deve ser maior que zero.');
+  if (isLong(c.entry, c.exit) && c.lunch == null) avisos.push('Jornada de 9h ou mais sem almoço.');
+  const pauses = [];
+  if (c.lunch != null) pauses.push({ name: 'almoço', s: c.lunch, e: c.lunch + LUNCH_MIN });
+  pauses.push({ name: 'snack', s: c.snack, e: c.snack + (c.snackDur > 0 ? c.snackDur : 0) });
+  for (const p of pauses) {
+    if (p.s < c.entry) erros.push(`O ${p.name} deve começar depois da entrada.`);
+    else if (p.s === c.entry) avisos.push(`O ${p.name} começa junto com a entrada.`);
+    if (p.e > c.exit) erros.push(`O ${p.name} deve terminar antes da saída.`);
+    else if (p.e === c.exit && p.e > p.s) avisos.push(`O ${p.name} termina junto com a saída.`);
+  }
+  if (c.lunch != null && c.snackDur > 0) {
+    const [first, second] = [...pauses].sort((a, b) => a.s - b.s);
+    if (second.s < first.e) erros.push('O almoço e o snack se sobrepõem.');
+    else if (c.snack < c.lunch) avisos.push('O snack começa antes do almoço.');
+  }
+  if (c.exit - c.entry > LONG_SHIFT_WARN_MIN) avisos.push('Jornada acima de 10h.');
+  return { erros, avisos };
 }
+/** Só os erros que bloqueiam (compatível com quem só precisa saber se pode salvar). */
+export const validateConfig = (c) => checkConfig(c).erros;
 
 // ---------- Folgas x escala ----------
 
@@ -149,7 +179,7 @@ export function coverage(shifts, date, timeoffs) {
   if (!shifts?.length) return 'none';
   const sorted = [...shifts].sort((a, b) => a.startTime.localeCompare(b.startTime));
   const s0 = isoMin(sorted[0].startTime);
-  const s1 = isoMin(sorted.at(-1).endTime);
+  const s1 = minutesOnDay(sorted.at(-1).endTime, date); // 1440 se termina às 24:00
   const ivs = timeoffs
     .filter((t) => timeoffTouchesDay(t, date))
     .map((t) => [Math.max(s0, minutesOnDay(t.startTime, date)), Math.min(s1, minutesOnDay(t.endTime, date))])
@@ -192,13 +222,14 @@ export function weekdaysLabel(s) {
 
 export const definitionSummary = (def) => `${weekdaysLabel(def.weekdays)} · ${minToHHMM(def.entry)}–${minToHHMM(def.exit)}`;
 
-/** Erros de uma definição (dias da semana + horários do dia, com as regras de almoço/snack). */
-export function validateDefinition(def) {
-  const errs = [];
-  if (!parseWeekdays(def.weekdays).size) errs.push('Marque ao menos um dia da semana.');
-  errs.push(...validateConfig({ taskId: 'x', entry: def.entry, lunch: isLong(def.entry ?? 0, def.exit ?? 0) ? def.lunch : null, snack: def.snack, snackDur: def.snackDur, exit: def.exit }));
-  return errs;
+/** { erros, avisos } de uma definição (dias da semana + horários do dia, com as regras de almoço/snack). */
+export function checkDefinition(def) {
+  const erros = [];
+  if (!parseWeekdays(def.weekdays).size) erros.push('Marque ao menos um dia da semana.');
+  const r = checkConfig({ taskId: 'x', entry: def.entry, lunch: isLong(def.entry ?? 0, def.exit ?? 0) ? def.lunch : null, snack: def.snack, snackDur: def.snackDur, exit: def.exit });
+  return { erros: [...erros, ...r.erros], avisos: r.avisos };
 }
+export const validateDefinition = (def) => checkDefinition(def).erros;
 
 /** Turnos do mês inteiro a partir de uma definição: { [dia]: Shift[] } (só os dias da semana marcados). */
 export function planMonth(def, month, taskId, ctx) {
@@ -243,3 +274,22 @@ export const VERIFY_TTL_MIN = 30;
 const verifyOpen = (e) => !!e.verifyRequestedAt && (!e.lastCheckAt || e.verifyRequestedAt > e.lastCheckAt);
 export const verifyPending = (e, now = Date.now()) => verifyOpen(e) && now - Date.parse(e.verifyRequestedAt) < VERIFY_TTL_MIN * 60000;
 export const verifyStale = (e, now = Date.now()) => verifyOpen(e) && !verifyPending(e, now);
+
+// ---------- escolher dias do mês (aplicar a mesma escala em vários dias de um agente) ----------
+/**
+ * Dias do mês escolhidos por intervalo e dias da semana. `from`/`to`: números de dia (inclusivos); `weekdays`: dígitos 1..7 (dom..sáb) em
+ * texto, ou Set; vazio = todos os dias da semana. Dias bloqueados (`locked`, ex.: folga total) nunca entram. Sem `includeEmpty`, só entram dias
+ * que já têm escala (`hasShift`): é o "ajustar uma escala que já existe num intervalo" sem escalar o agente em dias de folga por engano.
+ */
+export function pickDays({ month, from, to, weekdays = '', hasShift = () => true, locked = () => false, includeEmpty = false }) {
+  const wd = weekdays instanceof Set ? weekdays : parseWeekdays(weekdays);
+  const n = daysInMonth(month), a = Math.max(1, Math.min(from, to)), b = Math.min(n, Math.max(from, to));
+  const out = [];
+  for (let d = a; d <= b; d++) {
+    if (locked(d)) continue;
+    if (wd.size && !wd.has(weekdayDigit(dateOf(month, d)))) continue;
+    if (!includeEmpty && !hasShift(d)) continue;
+    out.push(d);
+  }
+  return out;
+}

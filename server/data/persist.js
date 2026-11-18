@@ -4,7 +4,7 @@
 //   - a cada mudança, `mark*()` agenda a gravação; várias mudanças seguidas viram UMA gravação por aba (cota do Sheets: ~60 gravações/min por conta);
 //   - `flush()` grava já (usado no encerramento e nas operações que não podem esperar).
 // Nunca é lida de volta durante a execução: edição manual dessas abas só vale no próximo início do app.
-import { hhmmToMin, minToHHMM } from '../../shared/rules.js';
+import { exitFromInput, hhmmToMin, minToHHMM } from '../../shared/rules.js';
 
 export const HEAD = {
   drafts: ['draftKey (time|YYYY-MM)', 'team', 'month', 'version', 'status', 'openedBy', 'openedAt', 'updatedBy', 'updatedAt'],
@@ -12,7 +12,8 @@ export const HEAD = {
   gen: ['team', 'email (* = time)', 'taskId (workstream/multitask)', 'escalaPadraoId', 'diasSemana', 'entrada', 'almoco', 'snack', 'duracaoSnack', 'saida', 'updatedBy', 'updatedAt'],
   batches: ['batchId', 'team', 'month', 'createdBy', 'createdAt', 'agentEmails (JSON)', 'items', 'files', 'csvRows', 'removals (JSON)', 'jiraKey', 'jiraStatus'],
   exports: ['id', 'batchId', 'team', 'month', 'name', 'windowFrom', 'windowTo', 'agents (JSON emails)', 'rows', 'status', 'createdAt', 'createdBy', 'attempts', 'lastCheckAt', 'consolidatedAt', 'deleteAfter', 'note', 'csvHash', 'fileId', 'expected (JSON)', 'verifyRequestedAt', 'diferencas (JSON)'],
-  pedidos: ['id', 'tipo', 'agentEmail', 'reasonId', 'reasonName', 'startTime', 'endTime', 'targetExternalId', 'status', 'createdAt', 'scheduledAt', 'createdBy', 'externalId', 'note'],
+  pedidos: ['id', 'tipo', 'agentEmail', 'reasonId', 'reasonName', 'startTime', 'endTime', 'targetExternalId', 'status', 'createdAt', 'scheduledAt', 'createdBy', 'externalId', 'note', 'loteId'],
+  swaps: ['id', 'team', 'requester (e-mail)', 'owner (e-mail)', 'date (dia extra pedido)', 'offerDate (dia oferecido, opcional)', 'status', 'refusedBy', 'createdAt', 'updatedAt', 'decidedBy', 'note'],
   history: ['ts', 'actor', 'team', 'month', 'action', 'agentEmail', 'day', 'before', 'after', 'batchId', 'details'],
 };
 const CELL_MAX = 45000; // o limite de uma célula do Sheets é 50.000 caracteres
@@ -55,35 +56,27 @@ export function persistentDraftStore(store, persister) {
   const wrap = (name) => (...a) => { const r = store[name](...a); persister.markDrafts(); return r; };
   return {
     drafts: store.drafts, get: store.get,
-    saveDay: wrap('saveDay'), replaceAgents: wrap('replaceAgents'), discardItem: wrap('discardItem'),
+    saveDay: wrap('saveDay'), saveDays: wrap('saveDays'), replaceAgents: wrap('replaceAgents'), discardItem: wrap('discardItem'),
     discard: wrap('discard'), close: wrap('close'), reset: wrap('reset'),
   };
 }
 
 // ---------- configuração do gerador ----------
-const defRow = (d) => [d?.weekdays ?? '', minToHHMM(d?.entry ?? null), minToHHMM(d?.lunch ?? null), minToHHMM(d?.snack ?? null), d?.snackDur ?? '', minToHHMM(d?.exit ?? null)];
-
 export function genConfigToMatrix(map, now = new Date().toISOString()) {
   const rows = [HEAD.gen];
   for (const [team, cfg] of map) {
     const by = cfg.updatedBy ?? '', at = cfg.updatedAt ?? now;
-    rows.push([team, '*', cfg.taskId ?? '', '', '', '', '', '', '', '', by, at]);
-    for (const [email, a] of Object.entries(cfg.agents ?? {})) rows.push([team, email, '', a.scaleId ?? '', ...(a.scaleId ? ['', '', '', '', '', ''] : defRow(a.custom)), by, at]);
+    rows.push([team, '*', cfg.taskId ?? '', '', '', '', '', '', '', '', by, at]); // só o workstream/multitask padrão do time; a escala de cada agente vem da aba Users
   }
   return rows;
 }
 
+/** Lê só a linha `*` (workstream padrão do time). Linhas por agente de versões antigas são ignoradas (e somem na próxima gravação da aba). */
 export function loadGenConfig(map, matrix) {
   for (const r of matrix.slice(1)) {
     const team = str(r[0]), email = str(r[1]).toLowerCase();
-    if (!team || !email) continue;
-    const cfg = map.get(team) ?? { taskId: '', agents: {}, updatedBy: str(r[10]), updatedAt: str(r[11]) };
-    if (email === '*') cfg.taskId = str(r[2]);
-    else {
-      const scaleId = str(r[3]) || null;
-      cfg.agents[email] = { scaleId, custom: scaleId ? null : { weekdays: String(r[4] ?? '').replace(/[^1-7]/g, ''), entry: hhmmToMin(hhmm(r[5])), lunch: hhmm(r[6]) ? hhmmToMin(hhmm(r[6])) : null, snack: hhmmToMin(hhmm(r[7])), snackDur: Number(r[8]) || null, exit: hhmmToMin(hhmm(r[9])) } };
-    }
-    map.set(team, cfg);
+    if (!team || email !== '*') continue;
+    map.set(team, { taskId: str(r[2]), updatedBy: str(r[10]), updatedAt: str(r[11]) });
   }
   return map.size;
 }
@@ -122,10 +115,17 @@ export function loadExports(matrix) {
 export const EXPECTED_INLINE_MAX = CELL_MAX;
 
 // ---------- pedidos de folga (FolgasPedidos; o Apps Script os envia ao WFM) ----------
-export const pedidosToMatrix = (list) => [HEAD.pedidos, ...list.map((p) => [p.id, p.tipo, p.agentEmail, p.reasonId ?? '', p.reasonName ?? '', p.startTime ?? '', p.endTime ?? '', p.targetExternalId ?? '', p.status, p.createdAt ?? '', p.scheduledAt ?? '', p.createdBy ?? '', p.externalId ?? '', String(p.note ?? '').slice(0, 2000)])];
+export const pedidosToMatrix = (list) => [HEAD.pedidos, ...list.map((p) => [p.id, p.tipo, p.agentEmail, p.reasonId ?? '', p.reasonName ?? '', p.startTime ?? '', p.endTime ?? '', p.targetExternalId ?? '', p.status, p.createdAt ?? '', p.scheduledAt ?? '', p.createdBy ?? '', p.externalId ?? '', String(p.note ?? '').slice(0, 2000), p.loteId ?? ''])];
 export const loadPedidos = (matrix) => matrix.slice(1).filter((r) => str(r[0])).map((r) => ({
   id: str(r[0]), tipo: str(r[1]), agentEmail: str(r[2]).toLowerCase(), reasonId: str(r[3]), reasonName: str(r[4]), startTime: str(r[5]), endTime: str(r[6]), targetExternalId: str(r[7]),
-  status: str(r[8]), createdAt: str(r[9]), scheduledAt: str(r[10]), createdBy: str(r[11]), externalId: str(r[12]), note: str(r[13]),
+  status: str(r[8]), createdAt: str(r[9]), scheduledAt: str(r[10]), createdBy: str(r[11]), externalId: str(r[12]), note: str(r[13]), loteId: str(r[14]),
+}));
+
+// ---------- trocas de dia extra (aba Trocas; dona: o app) ----------
+export const swapsToMatrix = (list) => [HEAD.swaps, ...list.map((s) => [s.id, s.team, s.requester, s.owner, s.date, s.offerDate ?? '', s.status, s.refusedBy ?? '', s.createdAt ?? '', s.updatedAt ?? '', s.decidedBy ?? '', String(s.note ?? '').slice(0, 1000)])];
+export const loadSwaps = (matrix) => matrix.slice(1).filter((r) => str(r[0])).map((r) => ({
+  id: str(r[0]), team: str(r[1]), requester: str(r[2]).toLowerCase(), owner: str(r[3]).toLowerCase(), date: str(r[4]).slice(0, 10), offerDate: str(r[5]).slice(0, 10),
+  status: str(r[6]), refusedBy: str(r[7]), createdAt: str(r[8]), updatedAt: str(r[9]), decidedBy: str(r[10]), note: str(r[11]),
 }));
 
 // ---------- gravação agendada ----------
@@ -135,14 +135,14 @@ export const loadPedidos = (matrix) => matrix.slice(1).filter((r) => str(r[0])).
  */
 export function createPersister({ gateway, state, debounceMs = 1500, retryMs = 15000, onError = (e) => console.error('[persist]', e.message), setTimer = setTimeout, clearTimer = clearTimeout }) {
   let timer = null, queue = [], chain = Promise.resolve();
-  let dirty = { drafts: false, gen: false, batches: false, exports: false, pedidos: false };
+  let dirty = { drafts: false, gen: false, batches: false, exports: false, pedidos: false, swaps: false };
   const known = new Set();
   const p = { lastError: null };
 
   async function ensure(name, header) { if (!known.has(name)) { await gateway.ensureTab(name, header); known.add(name); } }
 
   async function run() {
-    const d = dirty, q = queue; dirty = { drafts: false, gen: false, batches: false, exports: false, pedidos: false }; queue = [];
+    const d = dirty, q = queue; dirty = { drafts: false, gen: false, batches: false, exports: false, pedidos: false, swaps: false }; queue = [];
     try {
       if (d.drafts) {
         const m = draftsToMatrices(state.drafts);
@@ -152,6 +152,7 @@ export function createPersister({ gateway, state, debounceMs = 1500, retryMs = 1
       if (d.gen) { await ensure('GeradorConfig', HEAD.gen); await gateway.replaceTab('GeradorConfig', genConfigToMatrix(state.genConfig)); }
       if (d.batches) { await ensure('Lotes', HEAD.batches); await gateway.replaceTab('Lotes', batchesToMatrix(state.batches)); }
       if (d.pedidos) { await ensure('FolgasPedidos', HEAD.pedidos); await gateway.replaceTab('FolgasPedidos', pedidosToMatrix(state.pedidos)); }
+      if (d.swaps) { await ensure('Trocas', HEAD.swaps); await gateway.replaceTab('Trocas', swapsToMatrix(state.swaps)); }
       if (d.exports) { await ensure('Exportacoes', HEAD.exports); await gateway.replaceTab('Exportacoes', exportsToMatrix(state.exports)); }
       const byTab = new Map();
       for (const e of q) { const t = historyTab(e.ts); if (!byTab.has(t)) byTab.set(t, []); byTab.get(t).push(historyRow(e)); }
@@ -171,6 +172,7 @@ export function createPersister({ gateway, state, debounceMs = 1500, retryMs = 1
   p.markBatches = () => { dirty.batches = true; schedule(); };
   p.markExports = () => { dirty.exports = true; schedule(); };
   p.markPedidos = () => { dirty.pedidos = true; schedule(); };
+  p.markSwaps = () => { dirty.swaps = true; schedule(); };
   p.logAudit = (entry) => { queue.push(entry); schedule(); };
   /** Grava agora e espera terminar (inclusive o que já estava em andamento). Não lança: veja `lastError`. */
   p.flush = () => { if (timer) { clearTimer(timer); timer = null; } chain = chain.then(run); return chain; };

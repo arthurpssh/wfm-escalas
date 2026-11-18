@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trocas · Gestão de escalas</title>
+  <link rel="stylesheet" href="https://static.hotmart.com/fonts/v1/css/hotmart-sans.min.css">
+  <link rel="stylesheet" href="https://static.hotmart.com/fonts/v1/css/hotmart-display.min.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/escalas"><img class="brand-logo" src="/img/hotmart-logo-color-negative.png" alt="Hotmart"><span class="brand-title">Gestão de escalas</span></a>
+    <nav id="nav" class="nav"></nav>
+    <div class="spacer"></div>
+    <label class="mock-login" title="Somente no mock">entrar como <select id="mockUser"></select></label>
+  </header>
+
+  <div class="toolbar">
+    <select id="teamSelect" title="Time"></select>
+    <div class="month-picker">
+      <button id="prevMonth" title="Mês anterior" aria-label="Mês anterior"><svg class="ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg></button>
+      <input type="month" id="monthInput">
+      <button id="nextMonth" title="Próximo mês" aria-label="Próximo mês"><svg class="ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
+    </div>
+    <div id="presence" class="presence hidden"></div>
+  </div>
+  <div id="roleBanner" class="banner hidden"></div>
+  <div id="info" class="banner hidden"></div>
+
+  <div class="admin-wrap">
+    <section class="panel-card">
+      <h3>Aguardando a supervisão <span id="pendCount" class="badge tf-pendente"></span></h3>
+      <p class="hint" style="margin:0 0 12px">Trocas de dia extra que o colega já aceitou. <b>Consolidar</b> coloca as mudanças no <b>rascunho</b> da escala (nada vai ao WFM até você revisar, confirmar e exportar, como sempre).</p>
+      <div id="pending"></div>
+    </section>
+
+    <section class="panel-card">
+      <h3>Demais trocas do mês</h3>
+      <div id="rest"></div>
+    </section>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="/trocas.js"></script>
+</body>
+</html>

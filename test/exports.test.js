@@ -269,3 +269,26 @@ test('"Já publiquei": depois que o Apps Script responde, dá para pedir de novo
   const novo = await a.exports.requestVerification('e1');
   assert.ok(novo.verifyRequestedAt > novo.lastCheckAt);
 });
+
+test('resultado aguardando_verificacao: continua em aberto e mostra o resumo; depois publicação parcial e consolidada', async () => {
+  const { g, a } = await comExportacao();
+  g.tabs.set('Verificacoes', [['ts', 'exportId', 'resultado', 'detalhe'], verifRow('2026-11-13T12:00:00.000Z', 'e1', 'aguardando_verificacao', 'Ainda não bate com o WFM: 1 dia(s) iguais ao publicado, 1 diferente(s) (ex.: ana dia 2).')]);
+  await a.tick();
+  let e = await a.exports.get('e1');
+  assert.deepEqual([e.status, e.attempts, e.diffs], ['aguardando_verificacao', 1, null]);
+  assert.match(e.note, /Ainda não bate com o WFM: 1 dia\(s\) iguais ao publicado/);
+  await a.flush();
+  // 20 s depois: parte publicada e parte em rascunho → nao_publicada com o texto da publicação parcial
+  g.tabs.get('Verificacoes').push(verifRow('2026-11-13T12:10:00.000Z', 'e1', 'nao_publicada', 'Publicação parcial: 2 de 3 dia(s) de agente ainda em rascunho (ana: dias 9–10); 1 já publicado(s). Publique o que falta no WFM.'));
+  const t0 = Date.now; Date.now = () => t0() + 20_000;
+  try {
+    const b = createSheetsRepo({ gateway: g, debounceMs: 60_000, now: () => Date.now() }); await b.init();
+    await b.tick();
+    e = await b.exports.get('e1');
+    assert.equal(e.status, 'nao_publicada'); assert.match(e.note, /Publicação parcial: 2 de 3 dia\(s\)/);
+    g.tabs.get('Verificacoes').push(verifRow('2026-11-13T12:20:00.000Z', 'e1', 'consolidada'));
+    Date.now = () => t0() + 60_000;
+    await b.tick();
+    assert.equal((await b.exports.get('e1')).status, 'consolidada');
+  } finally { Date.now = t0; }
+});

@@ -38,15 +38,33 @@ export function createSheetsGateway(env = process.env) {
     return token;
   }
 
+  // Chamadas à API na última hora (cada tentativa conta na cota do Google, que é por minuto e por conta de serviço, somando todos os
+  // ambientes que usam a mesma conta: produção, máquina de quem desenvolve...). Serve para diagnosticar "cota excedida".
+  const hits = []; // { at, kind: 'read' | 'write', throttled }
+  const note = (kind, throttled) => { const t = Date.now(); hits.push({ at: t, kind, throttled }); while (hits.length && t - hits[0].at > 3_600_000) hits.shift(); };
+  const lastMinute = () => { const t = Date.now(), m = hits.filter((h) => t - h.at <= 60_000); return { reads: m.filter((h) => h.kind === 'read').length, writes: m.filter((h) => h.kind === 'write').length, throttled: m.filter((h) => h.throttled).length }; };
+
   async function call(method, url, body, { okEmpty = false, raw = false, headers = {} } = {}) {
+    const kind = method === 'GET' ? 'read' : 'write';
+    let last = 0;
     for (let attempt = 0; attempt < 4; attempt++) {
       const r = await fetch(url, { method, headers: { Authorization: `Bearer ${await accessToken()}`, ...(body && !raw ? { 'Content-Type': 'application/json' } : {}), ...headers }, body: body ? (raw ? body : JSON.stringify(body)) : undefined });
-      if (r.status === 429 || r.status >= 500) { await new Promise((ok) => setTimeout(ok, 1000 * 2 ** attempt)); continue; } // cota/erro transitório
+      last = r.status;
+      note(kind, r.status === 429);
+      if (r.status === 429 || r.status >= 500) { // cota/erro transitório: espera (respeita Retry-After, com folga aleatória) e tenta de novo
+        const m = lastMinute();
+        console.warn(`[sheets] HTTP ${r.status} em ${method} ${url.replace(/\?.*/, '').slice(-50)} (tentativa ${attempt + 1}/4): ${m.reads} leitura(s) e ${m.writes} gravação(ões) deste processo no último minuto.`);
+        const raw = r.headers?.get?.('retry-after'), ra = raw == null || raw === '' ? NaN : Number(raw); // o cabeçalho, quando existe, manda
+        await new Promise((ok) => setTimeout(ok, (Number.isFinite(ra) ? Math.min(ra, 20) * 1000 : 1000 * 2 ** attempt) + Math.random() * 500));
+        continue;
+      }
       if (okEmpty && (r.status === 400 || r.status === 404)) return null;
       if (!r.ok) throw new Error(`Google API ${r.status} em ${method} ${url.replace(/\?.*/, '').slice(-60)}: ${(await r.text()).slice(0, 200)}`);
       return headers.Accept === 'text/plain' ? r.text() : r.json();
     }
-    throw new Error('Google API: cota ou erro transitório persistente.');
+    const e = new Error(`Google API: cota ou erro transitório persistente (HTTP ${last}).`);
+    e.status = 503; e.code = 'sheets_unavailable';
+    throw e;
   }
 
   const rangeOf = (name, a1 = '') => encodeURIComponent(`'${name}'${a1 ? '!' + a1 : ''}`);
@@ -81,6 +99,16 @@ export function createSheetsGateway(env = process.env) {
       return j?.values ?? [];
     },
     async listTabs() { return Object.keys(await loadMeta(true)); },
+    /** Várias abas numa só chamada (batchGet): conta como UMA leitura na cota. Se alguma aba não existir o Google recusa o lote todo; aí lê uma a uma. */
+    async readTabs(names) {
+      if (names.length < 2) return Promise.all(names.map((n) => this.readTab(n)));
+      const q = names.map((n) => `ranges=${rangeOf(n)}`).join('&');
+      const j = await call('GET', `${API}/${spreadsheetId}/values:batchGet?${q}&valueRenderOption=UNFORMATTED_VALUE`, null, { okEmpty: true });
+      if (!j) return Promise.all(names.map((n) => this.readTab(n)));
+      return names.map((_, i) => j.valueRanges?.[i]?.values ?? []);
+    },
+    /** Chamadas deste processo à API: último minuto (leituras, gravações, recusadas por cota) e recusas na última hora. */
+    stats() { return { ...lastMinute(), throttledLastHour: hits.filter((h) => h.throttled).length }; },
 
     /** Cria a aba (se faltar) e grava o cabeçalho quando a aba está vazia. */
     async ensureTab(name, header) {

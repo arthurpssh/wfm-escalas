@@ -1,9 +1,10 @@
 import {
   applyEdit, configToShifts, coverage, defaultConfig, dateOf, hhmmToMin, isLong, minToHHMM, minutesOnDay,
-  shiftsToConfig, timeoffTouchesDay, timeoffMarks, localDate, validateConfig, LUNCH_MIN, TZ,
+  shiftsToConfig, timeoffTouchesDay, timeoffMarks, localDate, checkConfig, exitFromInput, exitToInput, LUNCH_MIN, TZ,
 } from '/shared/rules.js';
 import { icon, withIcon } from '/icons.js';
 import { openGenerator } from '/generator.js';
+import { openAgentRange } from '/agentRange.js';
 import { $, esc, api, getJson, toast, setupMockLogin, dayLabel, fmtTs, fmtDT, TF_ACTIVE, TF_LABEL, decideTimeoff, renderNav, rememberView, fmtHM, startPresence, renderPresence } from '/common.js';
 
 const WD = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
@@ -20,7 +21,10 @@ const itemOf = (email, day) => S.data.draft?.items.find((i) => i.email === email
 const tfsOf = (email) => S.timeoffs.filter((t) => t.email === email);
 const activeTfsOf = (email) => tfsOf(email).filter((t) => TF_ACTIVE.has(t.status)); // pedidos pendentes e negadas não contam na cobertura
 const shiftsOf = (email, day) => S.data.cells[email]?.[day] ?? [];
-const sumShifts = (s) => (s?.length ? `${s[0].startTime.slice(11, 16)}–${s.at(-1).endTime.slice(11, 16)}` : '—');
+// fim às 00:00 do dia seguinte (saída às 24:00) aparece como 00:00 (+1)
+const endHM = (s) => s.endTime.slice(11, 16) + (s.endTime.slice(0, 10) > s.startTime.slice(0, 10) ? ' (+1)' : '');
+const endCell = (s) => s.endTime.slice(11, 16) + (s.endTime.slice(0, 10) > s.startTime.slice(0, 10) ? '<sup>+1</sup>' : '');
+const sumShifts = (s) => (s?.length ? `${s[0].startTime.slice(11, 16)}–${endHM(s.at(-1))}` : '—');
 
 // ---------- carga ----------
 async function init() {
@@ -151,10 +155,13 @@ function renderTable() {
       const pub = S.data.pending?.[a.email]?.includes(d) ? `<span class="pub" title="Aguardando importação/publicação no Tymeshift">${icon('upload', 14)}</span>` : '';
       const off = mk?.aprovada ? `<span class="off" title="Folga aprovada: ${esc(mk.aprovada.map((t) => t.reasonName).join(', '))}">folga</span>` : '';
       if (!shifts.length) return `<td class="cell${sel}${it ? ' removed' : ''}" ${attrs}${it ? ' title="Remoção no rascunho"' : ''}>${marksHtml}${it ? icon('x', 18) : off}${pub}</td>`;
-      const cls = { none: 'ok', partial: 'partial', full: 'full' }[coverage(shifts, dateOf(S.month, d), tos)];
-      return `<td class="cell ${cls}${sel}" ${attrs} title="${esc(a.name)} — ${d}/${S.month.slice(5)}">${shifts[0].startTime.slice(11, 16)}<br>${shifts.at(-1).endTime.slice(11, 16)}${marksHtml}${it ? `<i class="dot" title="Alteração no rascunho (${KIND[it.kind]})"></i>` : ''}${pub}</td>`;
+      const ex = S.data.extra?.[a.email]?.[d]; // dia extra: fora da escala padrão do agente
+      let cls = { none: 'ok', partial: 'partial', full: 'full' }[coverage(shifts, dateOf(S.month, d), tos)];
+      if (ex && cls === 'ok') cls = 'extra'; // folga continua mandando na cor; o "+" marca o dia extra de qualquer jeito
+      return `<td class="cell ${cls}${ex ? ' xt' : ''}${sel}" ${attrs} title="${esc(a.name)} — ${d}/${S.month.slice(5)}${ex ? ' · dia extra' : ''}">${ex ? '<span class="xtra" title="Dia extra: fora da escala padrão do agente">+</span>' : ''}${shifts[0].startTime.slice(11, 16)}<br>${endCell(shifts.at(-1))}${marksHtml}${it ? `<i class="dot" title="Alteração no rascunho (${KIND[it.kind]})"></i>` : ''}${pub}</td>`;
     }).join('');
-    return `<tr><td class="agent"><b title="${esc(a.email)}">${esc(a.email)}</b><small>${esc(a.name)}</small></td>${cells}</tr>`;
+    const ed = canEdit();
+    return `<tr><td class="agent${ed ? ' clickable' : ''}" ${ed ? `data-agent="${esc(a.email)}" title="Clique para configurar vários dias deste agente"` : ''}><b title="${esc(a.email)}">${esc(a.email)}</b><small>${esc(a.name)}</small></td>${cells}</tr>`;
   }).join('');
   const wrap = $('#tableWrap'), sl = wrap.scrollLeft, st = wrap.scrollTop;
   wrap.innerHTML = `<table><thead><tr><th class="agent">Agente</th>${head}</tr></thead><tbody>${rows}</tbody></table>`;
@@ -186,7 +193,7 @@ function closePanel() {
   closePanelForce(); renderTable();
 }
 const hasUnsaved = () => S.sel && JSON.stringify(S.cfg) !== JSON.stringify(S.baseCfg);
-const timeInput = (name, v, dis) => `<input type="time" step="60" data-f="${name}" value="${minToHHMM(v)}" ${dis ? 'disabled' : ''}>`;
+const timeInput = (name, v, dis) => `<input type="time" step="60" data-f="${name}" value="${minToHHMM(name === 'exit' ? exitToInput(v) : v)}" ${dis ? 'disabled' : ''}>`;
 
 function renderPanel() {
   const p = $('#panel'); p.classList.remove('hidden');
@@ -201,7 +208,7 @@ function renderPanel() {
   const it = itemOf(email, day);
   const c = S.cfg;
   const long = c && c.entry != null && c.exit != null && isLong(c.entry, c.exit);
-  const errors = c ? validateConfig(c) : [];
+  const { erros: errors, avisos: warns } = c ? checkConfig(c) : { erros: [], avisos: [] };
 
   let html = `<header><div><h2>${esc(agent.name)}</h2><small>${esc(email)}<br>${dayLabel(date)}</small></div><button id="closeBtn">${withIcon('x', 'Fechar')}</button></header>`;
   if (S.data.pending?.[email]?.includes(day)) html += `<div class="note">${icon('upload', 16)} Este dia está em um CSV já gerado e aguarda importação e <b>publicação</b> no Tymeshift (e a verificação do sistema).</div>`;
@@ -211,6 +218,7 @@ function renderPanel() {
     html += `<div class="actions">${edit ? `<button id="scaleBtn" class="primary">Escalar agente</button>` : ''}${it && edit ? `<button id="revertItem">Reverter alteração do dia</button>` : ''}</div>`;
   } else {
     html += `<h3 class="sec">Escala do dia</h3>`;
+    if (S.data.extra?.[email]?.[day]) html += `<div class="note extra">Dia extra: fora da escala padrão do agente.</div>`;
     if (S.irregular) html += `<div class="note">Este dia tem atividades fora do padrão entrada/almoço/snack/saída. Ao salvar, será reescrito neste padrão.</div>`;
     if (edit && cov === 'full') html += `<div class="note">Há folga total neste dia: a escala está bloqueada para edição.</div>`;
     else if (edit && cov === 'partial') html += `<div class="note">Há folga parcial neste dia; a escala continua editável.</div>`;
@@ -219,8 +227,9 @@ function renderPanel() {
       <div class="row"><label>Almoço (início)</label>${timeInput('lunch', long ? c.lunch : null, locked || !long)}</div>
       <div class="row"><label>Snack (início)</label>${timeInput('snack', c.snack, locked)}</div>
       <div class="row"><label>Snack (duração)</label><div><input type="number" min="1" step="1" style="width:90px" data-f="snackDur" value="${c.snackDur ?? ''}" ${locked ? 'disabled' : ''}> min</div></div>
-      <div class="row"><label>Saída</label>${timeInput('exit', c.exit, locked)}</div>`;
+      <div class="row"><label>Saída</label><div>${timeInput('exit', c.exit, locked)}${c.exit >= 1440 ? ' <small>24:00 (meia-noite do dia seguinte)</small>' : ''}</div></div>`;
     if (errors.length) html += `<ul class="errors">${errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>`;
+    if (warns.length) html += `<ul class="warns" title="Avisos não impedem salvar">${warns.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>`;
     html += timelineHtml(c, dayTfs, date, errors.length === 0);
     if (edit) html += `<div class="actions"><button id="saveDay" class="primary" ${locked || errors.length || !hasUnsaved() ? 'disabled' : ''}>Salvar no rascunho</button>
       <button id="resetDay" ${hasUnsaved() ? '' : 'disabled'}>Descartar edição</button>
@@ -293,7 +302,7 @@ function bindPanel() {
   $('#scaleBtn')?.addEventListener('click', () => { S.cfg = defaultConfig(S.meta.workTasks[0].taskId); S.baseCfg = null; S.irregular = false; renderPanel(); });
   p.querySelectorAll('[data-f]').forEach((el) => el.addEventListener('change', () => {
     const f = el.dataset.f;
-    const v = f === 'taskId' ? el.value : f === 'snackDur' ? Number(el.value) : hhmmToMin(el.value);
+    const v = f === 'taskId' ? el.value : f === 'snackDur' ? Number(el.value) : f === 'exit' ? exitFromInput(hhmmToMin(el.value)) : hhmmToMin(el.value); // saída 00:00 = 24:00
     if (v == null || Number.isNaN(v)) return renderPanel();
     S.cfg = applyEdit(S.cfg, f, v); renderPanel();
   }));
@@ -368,6 +377,7 @@ async function openReview() {
     <div class="note">Cada arquivo traz, para os agentes alterados, <b>todos os dias da janela</b> (o import do Tymeshift substitui o intervalo inteiro). Importe na ordem e <b>publique em seguida</b>: enquanto não publicar, o publicado desses agentes fica vazio na janela.</div>
     ${rv.unexpressible.length ? `<div class="note">${rv.unexpressible.length} remoção(ões) não cabem no CSV (o agente ficaria sem nenhum turno na janela): serão enviadas num <b>card único no Jira</b> (simulado por enquanto).</div>` : ''}
     ${rv.warnings.map((w) => `<div class="note">${esc(w)}</div>`).join('')}
+    ${rv.configWarnings?.length ? `<div class="note"><b>Avisos nas escalas</b> (não impedem confirmar):<ul>${rv.configWarnings.map((w) => `<li>${esc(w.agentName ?? w.email)} · ${String(w.day).padStart(2, '0')}/${S.month.slice(5)}: ${w.avisos.map(esc).join('; ')}</li>`).join('')}</ul></div>` : ''}
     ${rv.stale.length ? `<div class="note">Estes dias mudaram no WFM depois de entrarem no rascunho: ${rv.stale.map((s) => `${esc(s.email)} dia ${s.day}`).join('; ')}. Reverta-os para continuar.</div>` : ''}
     ${rv.errors.length ? `<div class="note"><b>Pré-voo reprovado:</b><br>${rv.errors.map(esc).join('<br>')}</div>` : ''}
     <div class="actions"><span class="spacer"></span>
@@ -400,7 +410,31 @@ async function renderJobs() {
 }
 
 // ---------- eventos ----------
-$('#tableWrap').addEventListener('click', (e) => { const td = e.target.closest('td.cell'); if (td) openDay(td.dataset.e, +td.dataset.d); });
+$('#tableWrap').addEventListener('click', (e) => {
+  const ag = e.target.closest('td.agent[data-agent]'); if (ag) return openRange(ag.dataset.agent);
+  const td = e.target.closest('td.cell'); if (td) openDay(td.dataset.e, +td.dataset.d);
+});
+
+/** Clicar no nome do agente: a mesma escala em vários dias do mês (calendário, intervalo, dias da semana) no rascunho. */
+function openRange(email) {
+  if (!canEdit()) return;
+  if (S.sel && hasUnsaved() && !confirm('Descartar alterações não salvas do dia atual?')) return;
+  if (S.sel) closePanelForce();
+  const agent = S.data.agents.find((a) => a.email === email);
+  openAgentRange({
+    agent, month: S.month, n: S.data.daysInMonth, today: localDate(), workTasks: S.meta.workTasks, ctx,
+    shiftsOf: (d) => shiftsOf(email, d),
+    coverageOf: (d) => coverage(shiftsOf(email, d), dateOf(S.month, d), activeTfsOf(email)),
+    onApply: async (days) => {
+      const ok = await draftOp(() => api('/api/draft/days', { method: 'PUT', body: { team: S.team, month: S.month, email, days, version: S.data.draft?.version ?? 0 } }), `Escala aplicada em ${days.length} dia(s), no rascunho.`);
+      if (!ok) throw new Error('falhou'); // draftOp já avisou; mantém o modal aberto
+    },
+    onRemove: async (ds) => {
+      const ok = await draftOp(() => api('/api/draft/days', { method: 'PUT', body: { team: S.team, month: S.month, email, days: ds.map((day) => ({ day, shifts: [] })), version: S.data.draft?.version ?? 0 } }), `Remoção de ${ds.length} dia(s) adicionada ao rascunho.`);
+      if (!ok) throw new Error('falhou');
+    },
+  });
+}
 $('#genBtn').onclick = async () => {
   if (S.sel && hasUnsaved() && !confirm('Descartar alterações não salvas do dia atual?')) return;
   closePanelForce(); renderTable();

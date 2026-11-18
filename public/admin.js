@@ -7,7 +7,7 @@ async function init() {
   await setupMockLogin($('#mockUser'), start);
   await start();
   startPresence({ page: 'admin', getCtx: () => ({}), onUpdate: () => {} });
-  setInterval(() => { if (me?.isAdmin) refreshPresence().catch(() => {}); }, 20000);
+  setInterval(() => { if (me?.isAdmin) { refreshPresence().catch(() => {}); renderSheets().catch(() => {}); } }, 20000);
 }
 async function start() {
   try { me = await getJson('/api/me'); } catch (e) { return toast(e.message, true); }
@@ -15,7 +15,7 @@ async function start() {
   renderNav('admin', me);
   $('#denied').classList.toggle('hidden', me.isAdmin);
   $('#content').classList.toggle('hidden', !me.isAdmin);
-  if (me.isAdmin) { await Promise.all([renderStats(), renderHistory(), renderAccess()]); await refreshPresence(); }
+  if (me.isAdmin) { await Promise.all([renderStats(), renderHistory(), renderAccess(), renderPortal(), renderSheets()]); await refreshPresence(); }
 }
 
 // Abas = rotas: /admin/estatisticas | /admin/historico | /admin/acessos
@@ -42,11 +42,35 @@ async function refreshPresence() {
   el.innerHTML = `<h3>Online agora (${sessions.length})</h3>${sessions.length ? `<table class="plain"><tr><th>Pessoa</th><th>Página</th><th>Time | mês</th><th>Online</th><th>Situação</th></tr>${sessions.map((u) => `<tr><td><b>${esc(u.name)}</b><br><small>${esc(u.email)}</small></td><td>${PAGE[u.page] ?? esc(u.page)}</td><td>${u.team ? esc(u.team) + (u.month ? ' | ' + u.month : '') : '—'}</td><td>${since(u.since)}${u.tabs > 1 ? ` <small>(${u.tabs} abas)</small>` : ''}</td><td>${u.editing.length ? `✎ editou ${u.editing.map((e) => 'há ' + Math.max(1, Math.round(e.agoSec / 60)) + ' min').join(', ')}` : u.active ? 'ativo' : 'aba em segundo plano'}</td></tr>`).join('')}</table>` : '<small>Ninguém online.</small>'}`;
 }
 
+/** Chamadas deste servidor à API do Google Sheets: a cota é por minuto e por conta de serviço (soma de todos os ambientes que a usam). */
+async function renderSheets() {
+  const el = document.getElementById('sheetsCard'); if (!el) return;
+  const s = await getJson('/api/admin/sheets');
+  if (!s || s.reads === undefined) { el.innerHTML = '<h3>Google Sheets (cota)</h3><small>Sem dados (DATA_SOURCE=mock).</small>'; return; }
+  el.innerHTML = `<h3>Google Sheets (cota)</h3>
+    <p><b>${s.reads}</b> leitura(s) e <b>${s.writes}</b> gravação(ões) <b>deste servidor</b> no último minuto · recusadas por cota: <b>${s.throttled}</b> (última hora: <b>${s.throttledLastHour}</b>)</p>
+    <p><small>O limite padrão do Google é de cerca de 60 leituras e 60 gravações por minuto por conta de serviço, somando todos os ambientes que usam a mesma conta (produção, computador de quem desenvolve...). Se houver recusas, veja se outro ambiente está ligado com a mesma conta. Cache: ${s.cacheSec} s (dados do dia a dia) e ${s.catalogCacheSec} s (times, usuários, atividades e escalas padrão; <b>SHEETS_CACHE_SEC</b> e <b>SHEETS_CATALOG_CACHE_SEC</b>).</small></p>`;
+}
+
+/** Estado do portal do agente: ligado/desligado, quantos agentes e se a razão de Férias está configurada. */
+async function renderPortal() {
+  const el = document.getElementById('portalCard'); if (!el) return;
+  const p = await getJson('/api/admin/portal');
+  const vac = p.vacation;
+  el.innerHTML = `<h3>Portal do agente</h3>
+    <p><span class="badge ${p.on ? 'tf-aprovada' : 'tf-negada'}">${p.on ? 'ligado' : 'desligado'}</span> <small>(${esc(p.source)}; troque em Config, linha <b>agent_portal</b>: on ou off)</small></p>
+    ${p.invalid ? '<div class="note">Valor inválido em Config.agent_portal: o portal foi mantido desligado. Use on ou off.</div>' : ''}
+    <p><small>${p.agents} agente(s) nos times; ${p.staffAgents} deles têm papel de supervisão (ou linha em Acessos) e continuam vendo o app completo. Ligado, os demais veem só <b>Minha escala</b>, mesmo no modo restrito.</small></p>
+    <p><small>Férias: ${vac.configured ? (vac.valid ? `razão <b>${esc(vac.reasonName)}</b> (Config.reason_vacation)` : '<b>id de Config.reason_vacation não existe nas razões</b>: os colegas verão "Folga total" ou "Folga parcial" no lugar de "Férias"') : 'Config.reason_vacation vazia: os colegas verão "Folga total" ou "Folga parcial" no lugar de "Férias"'}</small></p>`;
+}
+
 async function renderStats() {
   const s = await getJson('/api/admin/stats');
   const t = s.totals;
   const card = (n, l) => `<div class="card"><b>${n}</b><span>${l}</span></div>`;
   $('#tab-estatisticas').innerHTML = `<div class="cards">${card(t.actions, 'ações registradas')}${card(t.activeUsers, 'usuários ativos')}${card(t.checkouts, 'checkouts (lotes)')}${card(t.jiraCards, 'cards de remoção')}${card(t.openDrafts, 'rascunhos abertos')}${card(t.staleDrafts, 'rascunhos parados (>24h)')}</div>
+    <div class="panel-card" id="sheetsCard"><h3>Google Sheets (cota)</h3><small>carregando…</small></div>
+    <div class="panel-card" id="portalCard"><h3>Portal do agente</h3><small>carregando…</small></div>
     <div class="panel-card" id="presCard"><h3>Online agora</h3><small>carregando…</small></div>
     <div class="panel-card"><h3>Ações por tipo</h3>${bars(s.byAction)}</div>
     <div class="panel-card"><h3>Por usuário</h3>${bars(s.byActor)}</div>

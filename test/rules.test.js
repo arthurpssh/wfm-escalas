@@ -79,3 +79,64 @@ test('verificação pedida: em andamento, respondida e sem resposta (prazo)', ()
   assert.equal(verifyStale(e({}), now), false);
   assert.equal(verifyStale(e({ lastCheckAt: at(1) }), now), false);
 });
+
+// ---------- etapa A: avisos em vez de bloqueios, pausas em qualquer ordem, saída às 24:00 ----------
+import { checkConfig, validateDefinition, checkDefinition, exitFromInput, exitToInput, toIso, isoMinOn } from '../shared/rules.js';
+
+test('snack antes do almoço é aviso (não bloqueia) e as pausas saem em ordem de horário', () => {
+  const c = { ...long, snack: 600, lunch: 780 }; // snack 10:00, almoço 13:00
+  const r = checkConfig(c);
+  assert.deepEqual(r.erros, []);
+  assert.ok(r.avisos.some((a) => a.includes('snack começa antes do almoço')));
+  const shifts = configToShifts(c, '2026-11-10', CTX);
+  assert.deepEqual(shifts.map((s) => s.startTime.slice(11, 16)), ['09:00', '10:00', '10:15', '13:00', '14:00']);
+  assert.deepEqual(shifts.map((s) => s.endTime.slice(11, 16)), ['10:00', '10:15', '13:00', '14:00', '18:00']);
+  assert.equal(shifts.at(-1).taskId, shifts[0].taskId);
+  const back = shiftsToConfig(shifts, CTX);
+  assert.equal(back.irregular, false); assert.deepEqual(back.config, c); // ida e volta
+});
+
+test('o que gera CSV impossível continua bloqueando', () => {
+  assert.ok(checkConfig({ ...long, lunch: 780, snack: 790 }).erros.some((e) => e.includes('se sobrepõem'))); // snack dentro do almoço
+  assert.ok(checkConfig({ ...long, snack: 1070 }).erros.some((e) => e.includes('terminar antes da saída'))); // snack passa da saída
+  assert.ok(checkConfig({ ...long, snack: 500 }).erros.some((e) => e.includes('começar depois da entrada')));
+  assert.ok(checkConfig({ ...long, exit: 500 }).erros.some((e) => e.includes('saída deve ser depois')));
+  assert.ok(checkConfig({ ...long, snackDur: 0 }).erros.some((e) => e.includes('maior que zero')));
+  assert.ok(checkConfig({ ...long, taskId: '' }).erros.length);
+});
+
+test('avisos: pausa colada na saída, jornada longa sem almoço, jornada acima de 10h', () => {
+  assert.ok(checkConfig({ ...long, snack: 1065 }).avisos.some((a) => a.includes('snack termina junto com a saída')));
+  assert.deepEqual(checkConfig({ ...long, snack: 1065 }).erros, []);
+  assert.ok(checkConfig({ ...long, lunch: null }).avisos.some((a) => a.includes('sem almoço')));
+  assert.ok(checkConfig({ ...long, exit: 1200 }).avisos.some((a) => a.includes('acima de 10h')));
+  assert.deepEqual(checkConfig(long), { erros: [], avisos: [] });
+  const def = { weekdays: '23456', entry: 540, lunch: 780, snack: 600, snackDur: 15, exit: 1080 };
+  assert.deepEqual(validateDefinition(def), []); // compatibilidade: só os erros
+  assert.ok(checkDefinition(def).avisos.length);
+});
+
+test('saída às 24:00: 00:00 do dia seguinte, ida e volta, entrada de hora e cobertura de folga', () => {
+  assert.equal(toIso('2027-04-15', 1440), '2027-04-16T00:00:00-03:00');
+  assert.equal(toIso('2027-04-30', 1440), '2027-05-01T00:00:00-03:00'); // vira o mês
+  assert.equal(toIso('2027-04-15', 600), '2027-04-15T10:00:00-03:00');
+  assert.equal(exitFromInput(0), 1440); assert.equal(exitFromInput(1080), 1080); assert.equal(exitFromInput(null), null);
+  assert.equal(exitToInput(1440), 0); assert.equal(exitToInput(1080), 1080);
+  assert.equal(isoMinOn('2027-04-16T00:00:00-03:00', '2027-04-15'), 1440);
+  const c = { ...long, entry: 840, lunch: null, snack: 1200, snackDur: 45, exit: 1440 }; // 14:00 a 24:00
+  assert.deepEqual(checkConfig(c).erros, []);
+  const shifts = configToShifts(c, '2027-04-15', CTX);
+  assert.equal(shifts.at(-1).endTime, '2027-04-16T00:00:00-03:00');
+  const back = shiftsToConfig(shifts, CTX);
+  assert.equal(back.irregular, false); assert.equal(back.config.exit, 1440); assert.equal(back.config.entry, 840);
+  // folga até o fim do dia cobre tudo (full), não "parcial", mesmo com o turno terminando à meia-noite
+  const tf = [{ startTime: '2027-04-15T00:00:00-03:00', endTime: '2027-04-15T23:59:59-03:00' }];
+  assert.equal(coverage(shifts, '2027-04-15', tf), 'full');
+  assert.ok(checkConfig({ ...c, exit: 1500 }).erros.some((e) => e.includes('24:00')));
+});
+
+test('turno que vira o dia de verdade (22:00 a 02:00) é lido, mas marcado como fora do padrão editável', () => {
+  const shifts = [{ taskType: 'workstream', taskId: T, taskName: 'x', startTime: '2027-04-16T22:00:00-03:00', endTime: '2027-04-17T02:00:00-03:00' }];
+  const { config, irregular } = shiftsToConfig(shifts, CTX);
+  assert.equal(irregular, true); assert.equal(config.exit, 26 * 60);
+});

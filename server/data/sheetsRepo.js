@@ -5,10 +5,11 @@
 // Activities tem taskType,taskId,taskName; razões de folga na aba `TimeOffReasons` (taskId,taskName).
 import { createDraftStore } from '../core/drafts.js';
 import { createSheetFileStore } from './fileStore.js';
-import { mergeTimeoffView } from './timeoffView.js';
+import { groupLots, mergeTimeoffView, pedidosToLotRows } from './timeoffView.js';
+import { parseHolidays } from './holidays.js';
 import { randomUUID } from 'node:crypto';
 import { createAudit } from '../core/audit.js';
-import { EXPECTED_INLINE_MAX, createPersister, loadBatches, loadDrafts, loadExports, loadGenConfig, loadPedidos, persistentDraftStore, rowToHistory } from './persist.js';
+import { EXPECTED_INLINE_MAX, createPersister, loadBatches, loadDrafts, loadExports, loadGenConfig, loadPedidos, loadSwaps, persistentDraftStore, rowToHistory } from './persist.js';
 import { resolveAgentDefinition } from '../core/scales.js';
 import { minToHHMM, toLocalIso, verifyPending } from '../../shared/rules.js';
 
@@ -93,22 +94,42 @@ export function parseAccess(matrix) {
   return out;
 }
 
-export function createSheetsRepo({ gateway, cacheSec = 60, now = () => Date.now(), debounceMs = 1500 }) {
+export function createSheetsRepo({ gateway, cacheSec = 60, catalogCacheSec = cacheSec, now = () => Date.now(), debounceMs = 1500 }) {
   const cache = new Map(); // chave -> { at, value }
-  const cached = async (key, load) => {
+  const inflight = new Map(); // chave -> Promise: leituras simultâneas da mesma coisa viram UMA chamada à planilha
+  /**
+   * Leitura com cache. (1) Várias requisições ao mesmo tempo, com o cache vencido, compartilham a mesma leitura (antes cada uma ia à planilha:
+   * uma tela com 4 chamadas gerava dezenas de leituras de uma vez e estourava a cota por minuto). (2) Se a leitura falhar (cota, rede) e já
+   * houver um valor antigo, usa o antigo e tenta de novo em ~15 s, em vez de derrubar a tela; sem valor antigo, o erro continua.
+   */
+  const cached = (key, load, ttlSec = cacheSec) => {
     const hit = cache.get(key);
-    if (hit && now() - hit.at < cacheSec * 1000) return hit.value;
-    const value = await load();
-    cache.set(key, { at: now(), value });
-    return value;
+    if (hit && now() - hit.at < ttlSec * 1000) return Promise.resolve(hit.value);
+    if (inflight.has(key)) return inflight.get(key);
+    const p = (async () => {
+      try {
+        const value = await load();
+        cache.set(key, { at: now(), value });
+        return value;
+      } catch (e) {
+        if (!hit) throw e;
+        console.warn(`[sheets] ${key}: não deu para atualizar (${e.message}); usando o valor de ${Math.round((now() - hit.at) / 1000)} s atrás.`);
+        cache.set(key, { at: now() - Math.max(0, ttlSec * 1000 - 15_000), value: hit.value });
+        return hit.value;
+      } finally { inflight.delete(key); }
+    })();
+    inflight.set(key, p);
+    return p;
   };
+  /** Várias abas numa só leitura (batchGet) quando o gateway sabe; senão uma a uma. */
+  const readMany = (names) => (gateway.readTabs ? gateway.readTabs(names) : Promise.all(names.map((n) => gateway.readTab(n))));
   const notYet = async () => { const e = new Error('Escrita ainda não disponível com DATA_SOURCE=sheets (Fase 3).'); e.status = 503; throw e; };
   const writeOnly = { list: async () => [], get: async () => null, add: notYet, update: notYet, remove: notYet };
 
   // Escrita (SHEETS_WRITE=1): rascunhos, configuração do gerador e histórico ficam na planilha (ver persist.js).
   const writable = !!gateway.writable;
   const baseStore = createDraftStore(), baseAudit = createAudit();
-  const state = { drafts: baseStore.drafts, genConfig: new Map(), batches: [], exports: [], pedidos: [] };
+  const state = { drafts: baseStore.drafts, genConfig: new Map(), batches: [], exports: [], pedidos: [], swaps: [] };
   // Arquivos grandes (CSV): no Drive se DRIVE_FOLDER_ID estiver definido (pasta numa Unidade compartilhada); senão, na aba `Arquivos`.
   const sheetFiles = writable ? createSheetFileStore({ gateway }) : null;
   const files = {
@@ -120,8 +141,8 @@ export function createSheetsRepo({ gateway, cacheSec = 60, now = () => Date.now(
   const audit = writable ? { ...baseAudit, log(e) { const entry = baseAudit.log(e); persister.logAudit(entry); return entry; } } : baseAudit;
   let lastVerifRead = 0;
   /** Resultados do envio de folgas (aba FolgasEnvios, do Apps Script) → pedidos. Idempotente: só atua em pedidos ainda "agendada"/"cancelada". */
-  const applyEnvios = async () => {
-    const rows = (await gateway.readTab('FolgasEnvios')).slice(1).filter((r) => r[1]).sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : 1));
+  const applyEnvios = async (matrix) => {
+    const rows = matrix.slice(1).filter((r) => r[1]).sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : 1));
     let changed = false;
     for (const r of rows) {
       const p = state.pedidos.find((x) => x.id === String(r[1]));
@@ -181,15 +202,23 @@ export function createSheetsRepo({ gateway, cacheSec = 60, now = () => Date.now(
   const wfmTimeoffs = () => cached('timeoffs', async () => parseTimeoffs(await gateway.readTab('TimeOffs')));
   const savePedidos = async () => { persister.markPedidos(); await persister.flushStrict(); };
   const merged = async () => mergeTimeoffView(await wfmTimeoffs(), state.pedidos, now());
+  const pedidoOf = (t) => ({ id: t.id, tipo: t.request ? 'solicitar' : 'criar', agentEmail: t.email, reasonId: t.reasonId, reasonName: t.reasonName, startTime: t.startTime, endTime: t.endTime, targetExternalId: '', status: 'agendada', createdAt: t.createdAt ?? new Date().toISOString(), scheduledAt: t.scheduledAt, createdBy: t.createdBy ?? '', externalId: '', note: '', loteId: t.loteId ?? '' });
   const timeoffsApi = writable ? {
     list: merged,
     get: async (id) => (await merged()).find((t) => t.id === id) ?? null,
     /** Nova folga (status "agendada"): vira um pedido "criar", enviado quando a carência de cancelamento acabar. */
     add: async (t) => {
-      state.pedidos.unshift({ id: t.id, tipo: 'criar', agentEmail: t.email, reasonId: t.reasonId, reasonName: t.reasonName, startTime: t.startTime, endTime: t.endTime, targetExternalId: '', status: 'agendada', createdAt: t.createdAt ?? new Date().toISOString(), scheduledAt: t.scheduledAt, createdBy: t.createdBy ?? '', externalId: '', note: '' });
+      state.pedidos.unshift(pedidoOf(t));
       await savePedidos();
       return t;
     },
+    /** Várias folgas de uma vez (lote): uma só gravação da aba, em vez de uma por agente. */
+    addMany: async (list) => {
+      state.pedidos.unshift(...list.map(pedidoOf)); // o lote fica junto, na ordem escolhida (o Apps Script envia na ordem da aba)
+      await savePedidos();
+      return list;
+    },
+    lots: async () => groupLots(pedidosToLotRows(state.pedidos)),
     update: async (id, patch) => {
       const p = state.pedidos.find((x) => x.id === id && x.tipo === 'criar' && x.status === 'agendada');
       if (p) { // edição de folga ainda dentro da carência
@@ -204,12 +233,28 @@ export function createSheetsRepo({ gateway, cacheSec = 60, now = () => Date.now(
       await savePedidos();
       return (await merged()).find((t) => t.id === id) ?? null;
     },
+    /** Cancela várias folgas ainda dentro da carência numa só gravação (cancelar um lote). Devolve quantas foram canceladas. */
+    removeMany: async (ids) => {
+      let n = 0;
+      for (const id of ids) { const p = state.pedidos.find((x) => x.id === id && (x.tipo === 'criar' || x.tipo === 'solicitar') && x.status === 'agendada'); if (p) { p.status = 'cancelada'; n++; } }
+      if (n) await savePedidos();
+      return n;
+    },
     /** Cancela uma folga ainda dentro da carência (o pedido fica no histórico como "cancelada"). */
     remove: async (id) => {
-      const p = state.pedidos.find((x) => x.id === id && x.tipo === 'criar' && x.status === 'agendada');
+      const p = state.pedidos.find((x) => x.id === id && (x.tipo === 'criar' || x.tipo === 'solicitar') && x.status === 'agendada');
       if (p) { p.status = 'cancelada'; await savePedidos(); }
     },
-  } : { ...writeOnly, list: wfmTimeoffs, get: async (id) => (await wfmTimeoffs()).find((t) => t.id === id) ?? null };
+  } : { ...writeOnly, addMany: notYet, removeMany: notYet, lots: async () => [], list: wfmTimeoffs, get: async (id) => (await wfmTimeoffs()).find((t) => t.id === id) ?? null };
+  // Trocas de dia extra entre agentes (aba Trocas; dona: o app). Em memória, gravadas junto com o resto (flushStrict: não finge sucesso).
+  const swapsApi = writable ? {
+    list: async () => [...state.swaps],
+    get: async (id) => state.swaps.find((s) => s.id === id) ?? null,
+    add: async (s) => { state.swaps.unshift(s); persister.markSwaps(); await persister.flushStrict(); return s; },
+    update: async (id, patch) => { const s = state.swaps.find((x) => x.id === id); if (!s) return null; Object.assign(s, patch); persister.markSwaps(); await persister.flushStrict(); return s; },
+  } : { list: async () => [], get: async () => null, add: notYet, update: notYet };
+  // Feriados: aba Feriados (dona: Apps Script); o app só lê. Aba inexistente = sem feriados.
+  const holidaysApi = { list: () => cached('feriados', async () => { try { return parseHolidays(await gateway.readTab('Feriados')); } catch { return []; } }) };
 
   // Acessos: edição na planilha continua valendo (leitura com cache de 60 s); o app inclui por append e revoga relendo a aba.
   const ACCESS_HEAD = ['email', 'team (nome do time ou *)', 'role', 'validUntil', 'grantedBy', 'grantedAt', 'note'];
@@ -239,12 +284,12 @@ export function createSheetsRepo({ gateway, cacheSec = 60, now = () => Date.now(
   return {
     kind: 'sheets', readOnly: !writable,
     // O que já pode gravar com DATA_SOURCE=sheets. Cada etapa da Fase 3 liga mais uma capacidade.
-    capabilities: { drafts: writable, generator: writable, audit: writable, checkout: writable, timeoffs: writable, access: writable, exports: writable },
+    capabilities: { drafts: writable, generator: writable, audit: writable, checkout: writable, timeoffs: writable, access: writable, exports: writable, swaps: writable },
     drafts, audit, persister,
     /** Carrega do Sheets o que o app grava (rascunhos, gerador, histórico). Chamar uma vez ao iniciar. */
     async init() {
       if (!writable) return { writable: false };
-      const [dr, it, gen, lotes, exps, peds] = await Promise.all(['Rascunhos', 'RascunhoItens', 'GeradorConfig', 'Lotes', 'Exportacoes', 'FolgasPedidos'].map((n) => gateway.readTab(n)));
+      const [dr, it, gen, lotes, exps, peds, trocas] = await readMany(['Rascunhos', 'RascunhoItens', 'GeradorConfig', 'Lotes', 'Exportacoes', 'FolgasPedidos', 'Trocas']);
       const d = loadDrafts(baseStore, dr, it);
       const g = loadGenConfig(state.genConfig, gen);
       const tabs = (await gateway.listTabs()).filter((n) => /^Histórico \d{4}-\d{2}$/.test(n));
@@ -254,6 +299,7 @@ export function createSheetsRepo({ gateway, cacheSec = 60, now = () => Date.now(
       state.batches = loadBatches(lotes);
       state.exports = loadExports(exps);
       state.pedidos = loadPedidos(peds);
+      state.swaps = loadSwaps(trocas);
       // "esperado" das exportações em aberto: inline ou no Drive (as já consolidadas não precisam dele)
       let expectedFailed = 0;
       for (const e of state.exports) {
@@ -267,14 +313,18 @@ export function createSheetsRepo({ gateway, cacheSec = 60, now = () => Date.now(
     /** Aba Config (key/value) como objeto; chaves em minúsculas. Cache de 60 s: alternar na planilha vale em até 1 minuto. */
     settings: () => cached('config', async () => Object.fromEntries(rowsToObjects(await gateway.readTab('Config')).map((r) => [str(r.key).toLowerCase(), str(r.value)]).filter(([k]) => k))),
     catalog: () => cached('catalog', async () => {
-      const [teams, users, activities, scales, reasons] = await Promise.all(['Teams', 'Users', 'Activities', 'EscalasPadrao', 'TimeOffReasons'].map((n) => gateway.readTab(n)));
+      const [teams, users, activities, scales, reasons] = await readMany(['Teams', 'Users', 'Activities', 'EscalasPadrao', 'TimeOffReasons']);
       if (users.length < 2) throw new Error('Aba Users vazia: a extração/IMPORTRANGE falhou. Mantendo o último catálogo.'); // o cache expirado não é usado como fallback aqui; falha explícita
       return buildCatalog({ teams, users, activities, scales, reasons });
-    }),
+    }, catalogCacheSec), // times, usuários, atividades e escalas padrão mudam pouco (a extração é diária): cache mais longo que o do resto
+    /** Chamadas deste processo ao Google (para a página Admin diagnosticar cota). */
+    sheetsInfo: () => ({ ...(gateway.stats?.() ?? {}), cacheSec, catalogCacheSec }),
     cells: (month) => cached(`cells:${month}`, async () => parseMonthSheet(await gateway.readTab(`Escala ${month}`)).cells),
     applyExpected: notYet,
     consolidate: notYet,
     timeoffs: timeoffsApi,
+    holidays: holidaysApi,
+    swaps: swapsApi,
     access: accessApi,
     batches: batchesApi,
     exports: exportsApi,
@@ -283,8 +333,9 @@ export function createSheetsRepo({ gateway, cacheSec = 60, now = () => Date.now(
     tick: async () => {
       if (!writable || now() - lastVerifRead < 15_000) return;
       lastVerifRead = now();
-      await applyEnvios();
-      const rows = (await gateway.readTab('Verificacoes')).slice(1).filter((r) => r[1]).sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : 1));
+      const [envM, verM] = await readMany(['FolgasEnvios', 'Verificacoes']); // uma leitura só para as duas abas
+      await applyEnvios(envM);
+      const rows = verM.slice(1).filter((r) => r[1]).sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : 1));
       let changed = false;
       for (const r of rows) {
         const e = state.exports.find((x) => x.id === String(r[1]));
@@ -301,7 +352,8 @@ export function createSheetsRepo({ gateway, cacheSec = 60, now = () => Date.now(
           let d = null;
           try { d = r[4] ? JSON.parse(String(r[4])) : null; } catch { /* sem diferenças detalhadas */ }
           Object.assign(e, { status: 'divergente', note: detail, diffs: Array.isArray(d?.items) ? d.items : null, diffTotal: d?.total ?? null });
-        } else if (res === 'expirada') Object.assign(e, { status: 'expirada', note: detail, diffs: null, diffTotal: null });
+        } else if (res === 'aguardando_verificacao') Object.assign(e, { status: 'aguardando_verificacao', note: detail, diffs: null, diffTotal: null }); // continua em aberto, agora com o resumo do que já bate
+        else if (res === 'expirada') Object.assign(e, { status: 'expirada', note: detail, diffs: null, diffTotal: null });
         audit.log({ actor: 'apps-script', team: e.team, month: e.month, action: 'export.verify', batchId: e.batchId, details: `${e.name} → ${e.status}` });
         changed = true;
       }

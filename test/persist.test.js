@@ -83,21 +83,18 @@ test('histórico: só inclusão, uma aba por mês, e volta ao reiniciar', async 
   assert.equal(e.day, 2);
 });
 
-test('gerador: configuração (escala padrão e personalizada) vai e volta', async () => {
+test('gerador: só o workstream padrão do time é gravado; linhas antigas por agente são ignoradas', async () => {
   const g = fakeGateway();
   const a = mk(g); await a.init();
-  await a.genConfig.set('t@x.com', { taskId: 'W1', updatedBy: 'u', agents: {
-    'a@x.com': { scaleId: 'EP01', custom: null },
-    'b@x.com': { scaleId: null, custom: { weekdays: '2345', entry: 11 * 60, lunch: 15 * 60, snack: 18 * 60, snackDur: 15, exit: 20 * 60 + 30 } },
-    'c@x.com': { scaleId: null, custom: { weekdays: '34567', entry: 7 * 60, lunch: null, snack: 11 * 60, snackDur: 45, exit: 13 * 60 + 20 } },
-  } });
+  await a.genConfig.set('t@x.com', { taskId: 'W1', updatedBy: 'u', agents: { 'a@x.com': { scaleId: 'EP01', custom: null } } });
   await a.flush();
+  assert.equal(g.tabs.get('GeradorConfig').length, 2); // cabeçalho + linha "*"
+  // planilha com uma linha por agente (versão antiga): lê só a "*"
+  const m = new Map();
+  loadGenConfig(m, [['team'], ['t@x.com', '*', 'W1', '', '', '', '', '', '', '', 'u', 'x'], ['t@x.com', 'a@x.com', '', 'EP01', '', '', '', '', '', '', 'u', 'x']]);
+  assert.deepEqual(m.get('t@x.com'), { taskId: 'W1', updatedBy: 'u', updatedAt: 'x' });
   const b = mk(g); await b.init();
-  const cfg = await b.genConfig.get('t@x.com');
-  assert.equal(cfg.taskId, 'W1');
-  assert.deepEqual(cfg.agents['a@x.com'], { scaleId: 'EP01', custom: null });
-  assert.deepEqual(cfg.agents['b@x.com'].custom, { weekdays: '2345', entry: 660, lunch: 900, snack: 1080, snackDur: 15, exit: 1230 });
-  assert.equal(cfg.agents['c@x.com'].custom.lunch, null);
+  assert.equal((await b.genConfig.get('t@x.com')).taskId, 'W1');
 });
 
 test('falha de gravação não perde nada: o próximo flush regrava', async () => {
@@ -126,9 +123,9 @@ test('somente leitura: sem SHEETS_WRITE nada é gravado e as capacidades ficam d
   assert.equal(g.tabs.size, 0);
 });
 
-test('capacidades com escrita ligada: só rascunhos, gerador e histórico (o resto continua desligado)', () => {
+test('capacidades com escrita ligada: tudo que o app grava (rascunhos, gerador, histórico, folgas, acessos, exportações, trocas)', () => {
   const a = mk(fakeGateway());
-  assert.deepEqual(a.capabilities, { drafts: true, generator: true, audit: true, checkout: true, timeoffs: true, access: true, exports: true });
+  assert.deepEqual(a.capabilities, { drafts: true, generator: true, audit: true, checkout: true, timeoffs: true, access: true, exports: true, swaps: true });
 });
 
 test('serialização: helpers puros', () => {
